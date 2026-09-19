@@ -23,7 +23,7 @@ import httpx
 
 BOT_TOKEN = "8215145424:AAGM0ImIq_YzbqziKRsrH3opVm9I3pnM_Sw"
 ADMIN_ID = 8986358602                         # твой user_id (узнать у @userinfobot)
-WEBAPP_URL = "git@github.com:trustgift/offersbot.git"   # адрес mini app
+WEBAPP_URL = "https://trustgift.github.io/offersbot/"   # адрес mini app
 BACKEND_URL = "https://offersbot-frwd.onrender.com"        # адрес этого backend (Render даст после деплоя)
 API_ID = 26259835                              # с my.telegram.org
 API_HASH = "3fa32264398920f001dd2428b42060f6"
