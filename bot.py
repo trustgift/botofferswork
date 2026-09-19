@@ -1,5 +1,5 @@
 import asyncio
-import os
+import os #ger
 import re
 import random
 from datetime import datetime
