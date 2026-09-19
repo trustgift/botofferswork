@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import BigInteger, String, Integer, DateTime, Text, select
+from sqlalchemy import BigInteger, String, Integer, DateTime, Text, select, text
 import uvicorn
 
 from telethon import TelegramClient
@@ -83,7 +83,6 @@ class User(Base):
 
 
 class BusinessConn(Base):
-    """Хранит подключение бизнес-бота к аккаунту воркера."""
     __tablename__ = "business_conn"
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     connection_id: Mapped[str] = mapped_column(String(128), nullable=True)
@@ -134,9 +133,26 @@ class Log(Base):
 
 
 async def init_db():
+    """Создаёт таблицы если их нет + добавляет недостающие колонки в старые."""
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all, checkfirst=True)
+            migrations = [
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(64)",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_offers INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(16) DEFAULT 'user'",
+                "ALTER TABLE offers ADD COLUMN IF NOT EXISTS target_user_id BIGINT",
+                "ALTER TABLE offers ADD COLUMN IF NOT EXISTS worker_username VARCHAR(64)",
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT",
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS state VARCHAR(16) DEFAULT 'pending'",
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
+            ]
+            for sql in migrations:
+                try:
+                    await conn.execute(text(sql))
+                except Exception as e:
+                    print(f"migration skip: {e}")
     except Exception as e:
         print(f"init_db warning: {e}")
 
@@ -190,8 +206,7 @@ async def save_business_conn(user_id, connection_id, can_reply="unknown"):
             c.can_reply = can_reply
             c.updated_at = datetime.utcnow()
         else:
-            c = BusinessConn(user_id=user_id, connection_id=connection_id,
-                             can_reply=can_reply)
+            c = BusinessConn(user_id=user_id, connection_id=connection_id, can_reply=can_reply)
             s.add(c)
         await s.commit()
 
@@ -384,7 +399,7 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint):
 
         msg_id = getattr(target, "msg_id", None)
         if not msg_id:
-            result["error"] = "нет msg_id"
+            result["error"] = "нет msg_id у подарка"
             return result
 
         try:
@@ -485,29 +500,22 @@ class GrantForm(StatesGroup):
     user_id = State()
 
 
-class BalanceForm(StatesGroup):
-    user_id = State()
-    amount = State()
-
-
 # ═══════════════════════════════════════════════════════
 #   BUSINESS CONNECTION
 # ═══════════════════════════════════════════════════════
 
 @dp.business_connection()
 async def on_business_connection(conn: types.BusinessConnection):
-    """Ловим подключение бизнес-бота к аккаунту."""
     try:
-        await save_business_conn(conn.user.id, conn.id, conn.can_reply and "yes" or "no")
+        await save_business_conn(conn.user.id, conn.id, "yes" if conn.can_reply else "no")
         u = conn.user
         print(f"Business connection: user={u.id} @{u.username} conn_id={conn.id}")
         try:
             await bot.send_message(
                 u.id,
                 f"🔌 <b>Бизнес-бот подключён</b>\n\n"
-                f"Ваш ID: <code>{u.id}</code>\n"
-                f"Теперь вы можете создавать офферы командой:\n"
-                f"<code>/offer user_id ссылка сумма</code>"
+                f"Ваш ID: <code>{u.id}</code>\n\n"
+                f"Создать оффер:\n<code>/offer user_id ссылка сумма</code>"
             )
         except Exception:
             pass
@@ -596,7 +604,7 @@ async def my_conn_callback(call: types.CallbackQuery):
             f"├ ID: <code>{conn.connection_id}</code>\n"
             f"├ Can reply: <b>{conn.can_reply}</b>\n"
             f"└ Обновлено: {conn.updated_at:%d.%m.%Y %H:%M}\n\n"
-            f"<b>Как создать оффер:</b>\n"
+            f"<b>Создать оффер:</b>\n"
             f"<code>/offer user_id ссылка сумма</code>\n\n"
             f"Пример:\n"
             f"<code>/offer 123456789 https://t.me/nft/DeskCalendar-284528 650</code>"
@@ -604,11 +612,10 @@ async def my_conn_callback(call: types.CallbackQuery):
     else:
         text = (
             f"❌ <b>Бизнес-бот не подключён</b>\n\n"
-            f"Чтобы подключить:\n"
             f"1. Telegram → Настройки → Telegram Business\n"
             f"2. Чат-боты → Добавить бота\n"
             f"3. Введи <code>@{BOT_USERNAME}</code>\n"
-            f"4. Дай права на чтение и отправку сообщений"
+            f"4. Дай права на чтение и отправку"
         )
     await call.message.edit_text(
         text,
@@ -687,25 +694,21 @@ async def request_access(call: types.CallbackQuery):
 # ═══════════════════════════════════════════════════════
 
 def parse_target_and_offer(text):
-    """Парсит: /offer <target_user_id> <ссылка> <сумма>"""
     m = re.search(r'(https?://t\.me/nft/[\w\-]+)', text)
     if not m:
         return None
     gift_link = m.group(1)
     gift_name = gift_link.split("/")[-1].replace("-", " #")
-
     without_link = text.replace(gift_link, "")
     without_cmd = without_link.replace("/offer", "").strip()
     parts = without_cmd.split()
     if len(parts) < 2:
         return None
-
     try:
         target_user_id = int(parts[0])
         price_stars = int(parts[1])
     except ValueError:
         return None
-
     return gift_name, gift_link, price_stars, target_user_id
 
 
@@ -731,15 +734,13 @@ def make_offer_kb(offer_id):
 
 @dp.message(Command("offer"))
 async def cmd_offer(message: types.Message):
-    """Команда /offer в личке бота — отправляет оффер мамонту через бизнес-подключение воркера."""
     uid = message.from_user.id
     u = await get_user(uid)
     if not u or u.role not in ("worker", "admin"):
         await message.answer("❌ Нет доступа воркера. Напишите /start")
         return
 
-    text = message.text or ""
-    parsed = parse_target_and_offer(text)
+    parsed = parse_target_and_offer(message.text or "")
     if not parsed:
         await message.answer(
             "❌ Формат:\n<code>/offer user_id ссылка сумма</code>\n\n"
@@ -749,19 +750,17 @@ async def cmd_offer(message: types.Message):
 
     gift_name, gift_link, price_stars, target_user_id = parsed
 
-    # проверяем что цель — не сам воркер
     if target_user_id == uid:
         await message.answer("❌ Нельзя отправить оффер самому себе.")
         return
 
-    # проверяем бизнес-подключение
     conn = await get_business_conn(uid)
     if not conn or not conn.connection_id:
         await message.answer(
-            "❌ <b>Бизнес-бот не подключён</b>\n\n"
-            "Подключите: Telegram → Настройки → Telegram Business → Чат-боты → "
+            f"❌ <b>Бизнес-бот не подключён</b>\n\n"
+            f"Подключите: Telegram → Настройки → Telegram Business → Чат-боты → "
             f"добавьте @{BOT_USERNAME}\n\n"
-            "После подключения напишите /start"
+            f"После подключения напишите /start"
         )
         return
 
@@ -773,7 +772,7 @@ async def cmd_offer(message: types.Message):
         target_user_id=target_user_id, duration_hours=24,
     )
 
-    # пытаемся отправить мамонту через бизнес-подключение
+    sent = False
     try:
         await bot.send_message(
             chat_id=target_user_id,
@@ -784,12 +783,11 @@ async def cmd_offer(message: types.Message):
         sent = True
     except TelegramBadRequest as e:
         err = str(e).lower()
-        sent = False
         if "never contacted" in err or "not enough rights" in err or "peer_id_invalid" in err:
             await message.answer(
                 "⚠️ <b>Мамонт ещё не писал вам</b>\n\n"
-                "Telegram не разрешает боту писать первым тому, кто "
-                "не писал владельцу бизнес-аккаунта.\n\n"
+                "Telegram не разрешает боту писать первым тому, "
+                "кто не писал владельцу бизнес-аккаунта.\n\n"
                 "Попросите мамонта написать вам любое сообщение, "
                 "затем повторите команду.\n\n"
                 "Или перешлите ему эту карточку вручную:"
@@ -824,10 +822,6 @@ async def cmd_offer(message: types.Message):
         pass
 
 
-# ═══════════════════════════════════════════════════════
-#   WORKER — создание оффера кнопкой (без цели)
-# ═══════════════════════════════════════════════════════
-
 @dp.callback_query(F.data == "worker_create")
 async def create_start(call: types.CallbackQuery, state: FSMContext):
     u = await get_user(call.from_user.id)
@@ -838,7 +832,7 @@ async def create_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         "➕ <b>Создание оффера</b>\n\n"
         "🔗 Отправьте ссылку на подарок:\n"
-        "<i>или используйте команду:</i>\n"
+        "<i>или используйте:</i>\n"
         "<code>/offer user_id ссылка сумма</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
@@ -1198,7 +1192,7 @@ async def run_bot():
     await init_db()
     await bot.set_my_commands([
         BotCommand(command="start", description="Меню"),
-        BotCommand(command="offer", description="Создать оффер: /offer user_id ссылка сумма"),
+        BotCommand(command="offer", description="Создать: /offer user_id ссылка сумма"),
     ], scope=BotCommandScopeDefault())
     print("Bot polling started...")
     await dp.start_polling(bot)
