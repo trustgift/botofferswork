@@ -26,8 +26,10 @@ ADMIN_ID = 8986358602                         # твой user_id (узнать �
 WEBAPP_URL = "git@github.com:trustgift/offersbot.git"   # адрес mini app
 BACKEND_URL = "https://offersbot-frwd.onrender.com"        # адрес этого backend (Render даст после деплоя)
 API_ID = 26259835                              # с my.telegram.org
-API_HASH = "3fa32264398920f001dd2428b42060f6"                  # с my.telegram.org
-DATABASE_URL = "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"  # не трогай, работает из коробки
+API_HASH = "3fa32264398920f001dd2428b42060f6"
+
+DATABASE_URL = "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
+
 PORT = int(os.getenv("PORT", "8080"))
 
 # ═══════════════════════════════════════════════════════
@@ -94,8 +96,11 @@ class Log(Base):
 
 
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all, checkfirst=True)
+    except Exception as e:
+        print(f"init_db warning: {e}")
 
 
 async def get_user(user_id: int):
