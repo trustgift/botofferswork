@@ -27,14 +27,18 @@ WEBAPP_URL = "git@github.com:trustgift/offersbot.git"   # адрес mini app
 BACKEND_URL = "https://offersbot-frwd.onrender.com"        # адрес этого backend (Render даст после деплоя)
 API_ID = 26259835                              # с my.telegram.org
 API_HASH = "3fa32264398920f001dd2428b42060f6"                  # с my.telegram.org
-DATABASE_URL = "postgres://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb?sslmode=require"  # не трогай, работает из коробки
-PORT = 8080
+DATABASE_URL = "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"  # не трогай, работает из коробки
+PORT = int(os.getenv("PORT", "8080"))
 
 # ═══════════════════════════════════════════════════════
 #   ДАЛЬШЕ НИЧЕГО НЕ МЕНЯЙ
 # ═══════════════════════════════════════════════════════
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"ssl": "require"},
+)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
