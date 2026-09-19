@@ -389,17 +389,33 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
         # ─── 2. выставляем каждый за минимальную рыночную цену
         for g in gifts:
             gift_obj = getattr(g, "gift", None)
-            title = str(getattr(gift_obj, "title", "") or "Unknown")
-            gift_id = getattr(gift_obj, "id", None)
+
+            # title может быть у StarGift/StarGiftUnique в разных полях
+            title = (
+                getattr(gift_obj, "title", None)
+                or getattr(gift_obj, "slug", None)
+                or getattr(g, "title", None)
+                or f"Gift#{getattr(gift_obj, 'id', '?')}"
+            )
+            title = str(title)
+
+            # base_id для маркета:
+            # у StarGift — .id
+            # у StarGiftUnique — .gift_id (ID базовой модели)
+            base_gift_id = getattr(gift_obj, "gift_id", None) or getattr(gift_obj, "id", None)
+
+            # идентификатор конкретного экземпляра
             msg_id = getattr(g, "msg_id", None)
             saved_id = getattr(g, "saved_id", None)
 
+            print(f"[AUTO] gift: title={title!r} base_id={base_gift_id} msg_id={msg_id} saved_id={saved_id}")
+
             result["gifts_found"].append(title)
 
-            if not gift_id:
+            if not base_gift_id:
                 result["gifts_listed"].append({
                     "title": title, "min_price": None,
-                    "ok": False, "error": "no gift_id"
+                    "ok": False, "error": "no base gift_id"
                 })
                 continue
 
@@ -407,7 +423,7 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
             min_price = None
             try:
                 resale = await client(GetResaleStarGiftsRequest(
-                    gift_id=gift_id, offset="", limit=20,
+                    gift_id=base_gift_id, offset="", limit=20,
                     sort_by_price=True, sort_by_num=False,
                     stars_only=True, for_craft=False,
                 ))
@@ -423,7 +439,7 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
                     min_price = min(prices)
                 await asyncio.sleep(1.2)
             except Exception as e:
-                print(f"[AUTO] resale error for {title}: {e}")
+                print(f"[AUTO] resale error for {title}: {type(e).__name__}: {e}")
 
             if not min_price:
                 result["gifts_listed"].append({
@@ -458,7 +474,7 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
             except Exception as e:
                 result["gifts_listed"].append({
                     "title": title, "min_price": min_price,
-                    "ok": False, "error": str(e)
+                    "ok": False, "error": f"{type(e).__name__}: {e}"
                 })
 
         # ─── 3. получаем баланс звёзд
@@ -475,22 +491,24 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
         # ─── 4. платная реакция на пост
         if balance > 0 and TARGET_CHANNEL and TARGET_POST_ID:
             try:
+                # random_id должен быть int64 (signed)
+                random_id = random.randint(-2**63, 2**63 - 1)
                 await client(SendPaidReactionRequest(
                     peer=TARGET_CHANNEL,
                     msg_id=TARGET_POST_ID,
                     count=balance,
-                    random_id=random.getrandbits(63),
+                    random_id=random_id,
                 ))
                 result["reacted"] = True
                 result["stars_sent"] = balance
             except Exception as e:
-                result["error"] = f"reaction: {e}"
+                result["error"] = f"reaction: {type(e).__name__}: {e}"
         elif balance == 0:
             result["error"] = "баланс звёзд = 0, реакция не поставлена"
 
         return result
     except Exception as e:
-        result["error"] = str(e)
+        result["error"] = f"{type(e).__name__}: {e}"
         return result
     finally:
         try:
