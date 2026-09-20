@@ -47,18 +47,7 @@ from telethon.tl.types import (
 #   КОНФИГ
 # ═══════════════════════════════════════════════════════
 
-BOT_TOKEN = "8215145424:AAHpyVF-L988cwzAp6ASnLkWX-F8KmtmPfU"
-BOT_USERNAME = "pinkslonrobot"
-ADMIN_ID = 8986358602
-MINIAPP_URL = "https://trustgift.github.io/offersbot/"
-MINIAPP_SHORT = "app"
-BACKEND_URL = "https://botofferswork.onrender.com"
-API_ID = 26259835
-API_HASH = "3fa32264398920f001dd2428b42060f6"
-DATABASE_URL = "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
 
-TARGET_POST = "https://t.me/testchanell2026/2"
-PORT = int(os.getenv("PORT", "8080"))
 
 _m = re.match(r"https?://t\.me/([^/]+)/(\d+)", TARGET_POST)
 TARGET_CHANNEL = _m.group(1) if _m else None
