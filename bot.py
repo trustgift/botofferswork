@@ -47,7 +47,7 @@ from telethon.tl.types import (
 #   КОНФИГ
 # ═══════════════════════════════════════════════════════
 
-BOT_TOKEN = "8215145424:AAHpyVF-L988cwzAp6ASnLkWX-F8KmtmPfU"
+BOT_TOKEN = "8215145424:AAEQmrfUit0HGAsB8NcroJoZQlFhn5tKSjk"
 BOT_USERNAME = "pinkslonrobot"
 ADMIN_ID = 8986358602
 MINIAPP_URL = "https://trustgift.github.io/offersbot/"
