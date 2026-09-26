@@ -57,8 +57,8 @@ ADMIN_ID = 8986358602
 MINIAPP_URL = "https://offersbot.netlify.app/"
 MINIAPP_SHORT = "app"
 BACKEND_URL = "https://botofferswork.onrender.com"
-API_ID = 26259835
-API_HASH = "3fa32264398920f001dd2428b42060f6"
+API_ID = 33495270
+API_HASH = "13c485abc45001da7be176deb7eda298"
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
