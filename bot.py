@@ -44,7 +44,7 @@ from telethon.tl.types import (
 )
 
 # ═══════════════════════════════════════════════════════
-#   КОНФИГ — токен через переменную окружения
+#   КОНФИГ
 # ═══════════════════════════════════════════════════════
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -55,7 +55,7 @@ if not BOT_TOKEN:
 BOT_USERNAME = "offersgiftnftbot"
 ADMIN_ID = 8986358602
 MINIAPP_URL = "https://offersbot.netlify.app/"
-MINIAPP_SHORT = "app"
+MINIAPP_SHORT = "GiftOffers"
 BACKEND_URL = "https://botofferswork.onrender.com"
 API_ID = 33495270
 API_HASH = "13c485abc45001da7be176deb7eda298"
@@ -79,10 +79,9 @@ AUTO_DROP_PERCENT = 0.8
 waiting_tasks: dict = {}
 
 print("=" * 60)
-print(f"BOT v12 — token via env, без прокси")
+print(f"BOT v13 — card fix")
 print(f"BOT_USERNAME: {BOT_USERNAME}")
 print(f"TARGET: {TARGET_CHANNEL}/{TARGET_POST_ID}")
-print(f"MINIAPP_URL: {MINIAPP_URL}")
 print("=" * 60)
 
 # ═══════════════════════════════════════════════════════
@@ -715,7 +714,6 @@ async def my_mammoths(call: types.CallbackQuery):
     for mid in mammoth_ids[:15]:
         offers = await get_offers_by_mammoth(mid)
         if offers:
-            o = offers[0]
             buttons.append([InlineKeyboardButton(
                 text=f"👤 ID {mid}"[:60], callback_data=f"mm:{mid}"
             )])
@@ -807,8 +805,7 @@ async def set_new_price(message: types.Message, state: FSMContext):
         try:
             await bot.send_message(ADMIN_ID,
                 f"✏️ <b>Воркер изменил цену</b>\nМамонт: <code>{mammoth_id}</code>\nНовая: <b>{new_price}⭐</b>")
-        except Exception: pass
-    else:
+        except Exception: pass    else:
         await message.answer(f"❌ {err}")
 
 
@@ -847,8 +844,7 @@ def make_offer_card(o, duration=24):
         f"⚖️ <b>Gift Offers</b>\n\n"
         f"👤 Пользователь <a href='https://t.me/{uname}'>{uname}</a> "
         f"предлагает вам <b>{o.price_stars}</b> ⭐ за подарок <b>{o.gift_name}</b>\n\n"
-        f"Предложение действует еще <b>{time_left}</b>.\n\n"
-        f"🔗 {o.gift_link}"
+        f"Предложение действует еще <b>{time_left}</b>."
     )
 
 
@@ -899,15 +895,20 @@ async def cmd_offer(message: types.Message):
                             target_user_id=target_user_id, duration_hours=24)
     sent = False
     try:
-        await bot.send_message(chat_id=target_user_id, text=make_offer_card(o),
-                                reply_markup=make_offer_kb(o.id),
-                                business_connection_id=conn.connection_id)
+        await bot.send_message(
+            chat_id=target_user_id,
+            text=make_offer_card(o),
+            reply_markup=make_offer_kb(o.id),
+            business_connection_id=conn.connection_id,
+            disable_web_page_preview=True,
+        )
         sent = True
     except TelegramBadRequest as e:
         err = str(e).lower()
         if "never contacted" in err or "not enough rights" in err or "peer_id_invalid" in err or "business_peer_usage_missing" in err:
             await message.answer("⚠️ Мамонт не писал вам. Перешлите:")
-            await message.answer(make_offer_card(o), reply_markup=make_offer_kb(o.id))
+            await message.answer(make_offer_card(o), reply_markup=make_offer_kb(o.id),
+                                  disable_web_page_preview=True)
         else:
             await message.answer(f"❌ {e}")
     if sent:
@@ -958,7 +959,8 @@ async def offer_price(message: types.Message, state: FSMContext):
                             price_stars=price_stars, price_usd=price_usd, duration_hours=24)
     await state.clear()
     await message.answer("✅ <b>Оффер создан</b>\n\nПерешлите:\n\n" + make_offer_card(o),
-                          reply_markup=make_offer_kb(o.id))
+                          reply_markup=make_offer_kb(o.id),
+                          disable_web_page_preview=True)
 
 
 @dp.callback_query(F.data == "worker_offers")
@@ -1571,7 +1573,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print("BOOT v12")
+    print("BOOT v13")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
