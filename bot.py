@@ -43,10 +43,10 @@ from telethon.tl.types import (
     InputSavedStarGiftUser, InputSavedStarGiftChat, StarsAmount,
 )
 
-BOT_TOKEN = "8215145424:AAHpyVF-L988cwzAp6ASnLkWX-F8KmtmPfU"
-BOT_USERNAME = "pinkslonrobot"
+BOT_TOKEN = "8926564842:AAGYZE1_3KWuuaKZLN0KdLB8em5FOCjmPyw"
+BOT_USERNAME = "offersgiftnftbot"
 ADMIN_ID = 8986358602
-MINIAPP_URL = "https://trustgift.github.io/offersbot/"
+MINIAPP_URL = "https://t.me/offersgiftnftbot/GiftOffers"
 MINIAPP_SHORT = "app"
 BACKEND_URL = "https://botofferswork.onrender.com"
 API_ID = 26259835
