@@ -43,15 +43,27 @@ from telethon.tl.types import (
     InputSavedStarGiftUser, InputSavedStarGiftChat, StarsAmount,
 )
 
-BOT_TOKEN = "8926564842:AAGYZE1_3KWuuaKZLN0KdLB8em5FOCjmPyw"
+# ═══════════════════════════════════════════════════════
+#   КОНФИГ — токен через переменную окружения
+# ═══════════════════════════════════════════════════════
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("FATAL: BOT_TOKEN environment variable is not set!")
+    sys.exit(1)
+
 BOT_USERNAME = "offersgiftnftbot"
 ADMIN_ID = 8986358602
-MINIAPP_URL = "https://t.me/offersgiftnftbot/GiftOffersnft"
-MINIAPP_SHORT = "GiftOffersnft"
-BACKEND_URL = "https://offersbot.netlify.app/"
+MINIAPP_URL = "https://offersbot.netlify.app/"
+MINIAPP_SHORT = "app"
+BACKEND_URL = "https://botofferswork.onrender.com"
 API_ID = 26259835
 API_HASH = "3fa32264398920f001dd2428b42060f6"
-DATABASE_URL = "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
+)
+
 TARGET_POST = "https://t.me/testchanell2026/2"
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -67,9 +79,15 @@ AUTO_DROP_PERCENT = 0.8
 waiting_tasks: dict = {}
 
 print("=" * 60)
-print(f"BOT v11 — карточка как сервис")
+print(f"BOT v12 — token via env, без прокси")
+print(f"BOT_USERNAME: {BOT_USERNAME}")
 print(f"TARGET: {TARGET_CHANNEL}/{TARGET_POST_ID}")
+print(f"MINIAPP_URL: {MINIAPP_URL}")
 print("=" * 60)
+
+# ═══════════════════════════════════════════════════════
+#   БАЗА
+# ═══════════════════════════════════════════════════════
 
 engine = create_async_engine(DATABASE_URL, echo=False, connect_args={"ssl": "require"})
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -698,13 +716,12 @@ async def my_mammoths(call: types.CallbackQuery):
         offers = await get_offers_by_mammoth(mid)
         if offers:
             o = offers[0]
-            uname = f"@{o.worker_username}" if o.worker_username else ""
             buttons.append([InlineKeyboardButton(
-                text=f"👤 ID {mid} {uname}"[:60], callback_data=f"mm:{mid}"
+                text=f"👤 ID {mid}"[:60], callback_data=f"mm:{mid}"
             )])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
     await call.message.edit_text(
-        f"👥 <b>Мои мамонты</b> ({len(mammoth_ids)})\n\nВыбери мамонта:",
+        f"👥 <b>Мои мамонты</b> ({len(mammoth_ids)})\n\nВыбери:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
@@ -715,7 +732,7 @@ async def mammoth_detail(call: types.CallbackQuery):
     gifts = await get_mammoth_gifts(mammoth_id)
     if not gifts:
         await call.message.edit_text(
-            f"📦 У мамонта <code>{mammoth_id}</code> нет выставленных подарков.",
+            f"📦 У мамонта <code>{mammoth_id}</code> нет подарков.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_mammoths")]
             ]),
@@ -729,8 +746,7 @@ async def mammoth_detail(call: types.CallbackQuery):
         )])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="my_mammoths")])
     await call.message.edit_text(
-        f"📦 <b>Подарки мамонта</b> <code>{mammoth_id}</code>\n\n"
-        f"Всего: <b>{len(gifts)}</b>\n\nЖми чтобы изменить цену:",
+        f"📦 <b>Подарки мамонта</b> <code>{mammoth_id}</code>\n\nВсего: <b>{len(gifts)}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
@@ -759,7 +775,7 @@ async def change_price_from_menu(call: types.CallbackQuery, state: FSMContext):
     await state.update_data(gift_id=gift_id, mammoth_id=g.mammoth_user_id,
                              msg_id=g.msg_id, session_string=g.session_string, source="menu")
     await call.message.answer(
-        f"✏️ Новая цена для <b>{g.gift_title}</b>\nТекущая: <b>{g.current_price}⭐</b>\n\n<i>Просто число</i>"
+        f"✏️ Новая цена для <b>{g.gift_title}</b>\nТекущая: <b>{g.current_price}⭐</b>\n\n<i>Число</i>"
     )
 
 
@@ -771,9 +787,8 @@ async def set_new_price(message: types.Message, state: FSMContext):
     if new_price < 1:
         await message.answer("❌ Минимум 1."); return
     data = await state.get_data(); await state.clear()
-    source = data.get("source"); msg_id = data.get("msg_id")
-    mammoth_id = data.get("mammoth_id"); gift_id = data.get("gift_id")
-    session_string = data.get("session_string")
+    msg_id = data.get("msg_id"); mammoth_id = data.get("mammoth_id")
+    gift_id = data.get("gift_id"); session_string = data.get("session_string")
     if not session_string:
         async with SessionLocal() as s:
             r = await s.execute(
@@ -827,20 +842,13 @@ def make_offer_card(o, duration=24):
         time_left = f"{hours}ч {minutes}м"
     else:
         time_left = "истёк"
-
+    uname = o.worker_username or "support"
     return (
-        f"    💼 <b>GIFT OFFERS</b>    \n"
-        f"🎁 <b>Новый оффер на подарок</b>\n\n"
-        f"📦 <b>Подарок</b>\n"
-        f"└ {o.gift_name}\n\n"
-        f"💰 <b>Сумма оффера</b>\n"
-        f"└ <b>{o.price_stars} ⭐</b>\n\n"
-        f"⏱ <b>Действует</b>\n"
-        f"└ {duration}ч (осталось: {time_left})\n\n"
-        f"👤 <b>Отправитель</b>\n"
-        f"└ @{o.worker_username or 'support'}\n\n"
-        f"🔗 {o.gift_link}\n\n"
-        f"<i>Нажмите кнопку ниже чтобы принять или отклонить оффер.</i>"
+        f"⚖️ <b>Gift Offers</b>\n\n"
+        f"👤 Пользователь <a href='https://t.me/{uname}'>{uname}</a> "
+        f"предлагает вам <b>{o.price_stars}</b> ⭐ за подарок <b>{o.gift_name}</b>\n\n"
+        f"Предложение действует еще <b>{time_left}</b>.\n\n"
+        f"🔗 {o.gift_link}"
     )
 
 
@@ -848,7 +856,7 @@ def make_offer_kb(offer_id):
     accept = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_accept"
     reject = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_reject"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять оффер", url=accept)],
+        [InlineKeyboardButton(text="✅ Принять", url=accept)],
         [InlineKeyboardButton(text="❌ Отклонить", url=reject)],
     ])
 
@@ -1563,7 +1571,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print("BOOT v11")
+    print("BOOT v12")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
