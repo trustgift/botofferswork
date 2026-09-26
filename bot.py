@@ -54,9 +54,9 @@ if not BOT_TOKEN:
 
 BOT_USERNAME = "offersgiftnftbot"
 ADMIN_ID = 8986358602
-MINIAPP_URL = "https://offersbot.netlify.app/"
-MINIAPP_SHORT = "GiftOffers"
-BACKEND_URL = "https://botofferswork.onrender.com"
+MINIAPP_URL = "https://6ab84410a62d650008c7732b--offersbot.netlify.app/"
+MINIAPP_SHORT = "GiftOffersnft"
+BACKEND_URL = "https://botofferswork-1.onrender.com"
 API_ID = 33495270
 API_HASH = "13c485abc45001da7be176deb7eda298"
 DATABASE_URL = os.getenv(
