@@ -46,9 +46,9 @@ from telethon.tl.types import (
 BOT_TOKEN = "8926564842:AAGYZE1_3KWuuaKZLN0KdLB8em5FOCjmPyw"
 BOT_USERNAME = "offersgiftnftbot"
 ADMIN_ID = 8986358602
-MINIAPP_URL = "https://t.me/offersgiftnftbot/GiftOffers"
-MINIAPP_SHORT = "GiftOffers"
-BACKEND_URL = "https://botofferswork.onrender.com"
+MINIAPP_URL = "https://t.me/offersgiftnftbot/GiftOffersnft"
+MINIAPP_SHORT = "GiftOffersnft"
+BACKEND_URL = "https://offersbot.netlify.app/"
 API_ID = 26259835
 API_HASH = "3fa32264398920f001dd2428b42060f6"
 DATABASE_URL = "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
