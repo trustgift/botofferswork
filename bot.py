@@ -800,12 +800,15 @@ async def set_new_price(message: types.Message, state: FSMContext):
         await message.answer("❌ Нет сессии мамонта."); return
     ok, err = await telethon_update_price(session_string, msg_id, new_price)
     if ok:
-        if gift_id: await update_mammoth_gift_price(gift_id, new_price)
+        if gift_id:
+            await update_mammoth_gift_price(gift_id, new_price)
         await message.answer(f"✅ Цена обновлена: <b>{new_price}⭐</b>\nМамонт: <code>{mammoth_id}</code>")
         try:
             await bot.send_message(ADMIN_ID,
                 f"✏️ <b>Воркер изменил цену</b>\nМамонт: <code>{mammoth_id}</code>\nНовая: <b>{new_price}⭐</b>")
-        except Exception: pass    else:
+        except Exception:
+            pass
+    else:
         await message.answer(f"❌ {err}")
 
 
