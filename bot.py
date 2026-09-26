@@ -829,11 +829,8 @@ def make_offer_card(o, duration=24):
         time_left = "истёк"
 
     return (
-        f"╔══════════════════════════╗\n"
         f"    💼 <b>GIFT OFFERS</b>    \n"
-        f"╚══════════════════════════╝\n\n"
         f"🎁 <b>Новый оффер на подарок</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📦 <b>Подарок</b>\n"
         f"└ {o.gift_name}\n\n"
         f"💰 <b>Сумма оффера</b>\n"
@@ -842,7 +839,6 @@ def make_offer_card(o, duration=24):
         f"└ {duration}ч (осталось: {time_left})\n\n"
         f"👤 <b>Отправитель</b>\n"
         f"└ @{o.worker_username or 'support'}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🔗 {o.gift_link}\n\n"
         f"<i>Нажмите кнопку ниже чтобы принять или отклонить оффер.</i>"
     )
