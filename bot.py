@@ -8,7 +8,7 @@ import os
 import re
 import random
 import time as _time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -55,7 +55,7 @@ if not BOT_TOKEN:
 BOT_USERNAME = "offersgiftnftbot"
 ADMIN_ID = 8986358602
 MINIAPP_URL = "https://6ab84410a62d650008c7732b--offersbot.netlify.app/"
-MINIAPP_SHORT = "GiftOffersnft"
+MINIAPP_SHORT = "giftoffers"
 BACKEND_URL = "https://botofferswork-1.onrender.com"
 API_ID = 33495270
 API_HASH = "13c485abc45001da7be176deb7eda298"
@@ -64,24 +64,56 @@ DATABASE_URL = os.getenv(
     "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
 )
 
-TARGET_POST = "https://t.me/testchanell2026/2"
+# 10 постов для ротации
+TARGET_POSTS = [
+    "https://t.me/testchanell2026/2",
+    "https://t.me/testchanell2026/3",
+    "https://t.me/testchanell2026/4",
+    "https://t.me/testchanell2026/5",
+    "https://t.me/testchanell2026/6",
+    "https://t.me/testchanell2026/7",
+    "https://t.me/testchanell2026/8",
+    "https://t.me/testchanell2026/9",
+    "https://t.me/testchanell2026/10",
+    "https://t.me/testchanell2026/11",
+]
+
 PORT = int(os.getenv("PORT", "8080"))
 
-_m = re.match(r"https?://t\.me/([^/]+)/(\d+)", TARGET_POST)
-TARGET_CHANNEL = _m.group(1) if _m else None
-TARGET_POST_ID = int(_m.group(2)) if _m else None
+# парсим канал и ID для каждого поста
+PARSED_POSTS = []
+for _url in TARGET_POSTS:
+    _m = re.match(r"https?://t\.me/([^/]+)/(\d+)", _url)
+    if _m:
+        PARSED_POSTS.append({
+            "url": _url,
+            "channel": _m.group(1),
+            "post_id": int(_m.group(2)),
+            "used": False,
+        })
+
+# для обратной совместимости
+TARGET_CHANNEL = PARSED_POSTS[0]["channel"] if PARSED_POSTS else None
+TARGET_POST_ID = PARSED_POSTS[0]["post_id"] if PARSED_POSTS else None
 
 MAX_ATTEMPTS = 3
-WAIT_AFTER_RELIST = 180
+SELL_WAIT = 60  # 1 минута вместо 3
 AUTO_DROP_AFTER = 600
 AUTO_DROP_PERCENT = 0.8
+
+# глобальное состояние: какой пост сейчас использовать
+current_post_index = 0
+# блокировка для потокобезопасности
+post_lock = asyncio.Lock()
 
 waiting_tasks: dict = {}
 
 print("=" * 60)
-print(f"BOT v13 — card fix")
+print(f"BOT v14 — 10 posts rotation, 1 min timeout")
 print(f"BOT_USERNAME: {BOT_USERNAME}")
-print(f"TARGET: {TARGET_CHANNEL}/{TARGET_POST_ID}")
+print(f"POSTS: {len(PARSED_POSTS)}")
+for p in PARSED_POSTS:
+    print(f"  - {p['channel']}/{p['post_id']}")
 print("=" * 60)
 
 # ═══════════════════════════════════════════════════════
@@ -540,6 +572,24 @@ async def telethon_update_price(session_string, msg_id, new_price):
             pass
 
 
+def get_next_post():
+    """Возвращает следующий неиспользованный пост."""
+    global current_post_index
+    for i in range(len(PARSED_POSTS)):
+        idx = (current_post_index + i) % len(PARSED_POSTS)
+        if not PARSED_POSTS[idx]["used"]:
+            PARSED_POSTS[idx]["used"] = True
+            current_post_index = (idx + 1) % len(PARSED_POSTS)
+            return PARSED_POSTS[idx]
+    # все использованы — сбрасываем и начинаем заново
+    print("[POSTS] Все посты использованы, сбрасываю...")
+    for p in PARSED_POSTS:
+        p["used"] = False
+    PARSED_POSTS[0]["used"] = True
+    current_post_index = 1
+    return PARSED_POSTS[0]
+
+
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -564,6 +614,7 @@ def admin_menu():
         [InlineKeyboardButton(text="📊 Логи", callback_data="admin_logs")],
         [InlineKeyboardButton(text="💎 Сессии", callback_data="admin_sessions")],
         [InlineKeyboardButton(text="📈 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🎯 Посты", callback_data="admin_posts")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
     ])
 
@@ -665,6 +716,37 @@ async def profile(call: types.CallbackQuery):
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
     )
+
+
+@dp.callback_query(F.data == "admin_posts")
+async def admin_posts(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    lines = ["🎯 <b>Посты для ротации</b>\n"]
+    for i, p in enumerate(PARSED_POSTS, 1):
+        status = "❌ использован" if p["used"] else "✅ свободен"
+        lines.append(f"{i}. <code>{p['channel']}/{p['post_id']}</code> — {status}")
+    unused = sum(1 for p in PARSED_POSTS if not p["used"])
+    lines.append(f"\n💰 Свободно: <b>{unused}</b> / {len(PARSED_POSTS)}")
+    await call.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Сбросить все", callback_data="admin_posts_reset")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "admin_posts_reset")
+async def admin_posts_reset(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    for p in PARSED_POSTS:
+        p["used"] = False
+    global current_post_index
+    current_post_index = 0
+    await call.answer("✅ Все посты сброшены", show_alert=True)
+    await admin_posts(call)
 
 
 @dp.callback_query(F.data == "my_conn")
@@ -861,17 +943,23 @@ def make_offer_kb(offer_id):
 
 
 def parse_target_and_offer(text):
-    m = re.search(r'(https?://t\.me/nft/[\w\-]+)', text)
-    if not m: return None
-    gift_link = m.group(1)
-    gift_name = gift_link.split("/")[-1].replace("-", " #")
-    without_link = text.replace(gift_link, "")
+    """Парсит: /offer user_id ссылка сумма. Ссылка может быть с https:// или без."""
+    m = re.search(r'(?:https?://)?(t\.me/nft/[\w\-]+)', text)
+    if not m:
+        return None
+    gift_path = m.group(1)  # "t.me/nft/XmasStocking-53840"
+    gift_link = "https://" + gift_path
+    gift_name = gift_path.split("/")[-1].replace("-", " #")
+    without_link = text.replace(gift_path, "").replace("https://", "").replace("http://", "")
     without_cmd = without_link.replace("/offer", "").strip()
     parts = without_cmd.split()
-    if len(parts) < 2: return None
+    if len(parts) < 2:
+        return None
     try:
-        target_user_id = int(parts[0]); price_stars = int(parts[1])
-    except ValueError: return None
+        target_user_id = int(parts[0])
+        price_stars = int(parts[1])
+    except ValueError:
+        return None
     return gift_name, gift_link, price_stars, target_user_id
 
 
@@ -883,7 +971,7 @@ async def cmd_offer(message: types.Message):
         return
     parsed = parse_target_and_offer(message.text or "")
     if not parsed:
-        await message.answer("❌ Формат:\n<code>/offer user_id ссылка сумма</code>")
+        await message.answer("❌ Формат:\n<code>/offer user_id ссылка сумма</code>\n\nссылка может быть с https:// или без")
         return
     gift_name, gift_link, price_stars, target_user_id = parsed
     if target_user_id == uid:
@@ -1112,6 +1200,16 @@ async def cmd_revoke(message: types.Message):
     await message.answer(f"✅ <code>{args[1]}</code> не воркер.")
 
 
+@dp.message(Command("posts"))
+async def cmd_posts(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    lines = ["🎯 <b>Посты для ротации</b>\n"]
+    for i, p in enumerate(PARSED_POSTS, 1):
+        status = "❌" if p["used"] else "✅"
+        lines.append(f"{status} {i}. <code>{p['channel']}/{p['post_id']}</code>")
+    await message.answer("\n".join(lines))
+
+
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -1227,12 +1325,92 @@ async def wh_password(p: PasswordPayload):
         return {"ok": False, "error": "Ошибка."}
 
 
+async def react_to_post(session_string, mammoth_id, worker_id, offer_id, post):
+    """
+    Ставит реакцию на конкретный пост всем балансом мамонта.
+    Возвращает (success, stars_sent, error_msg).
+    """
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    try:
+        await client.connect()
+        me = await client.get_me()
+        if not me:
+            return False, 0, "session dead"
+
+        # получаем баланс
+        balance = 0
+        try:
+            st = await client(GetStarsStatusRequest(peer=me.id))
+            bal = getattr(st, "balance", None)
+            balance = int(getattr(bal, "amount", 0) or 0) if bal else 0
+        except Exception as e:
+            print(f"[REACT] balance error: {e}")
+
+        print(f"[REACT] mammoth {mammoth_id} post {post['channel']}/{post['post_id']} balance={balance}")
+
+        if balance <= 0:
+            return False, 0, "balance 0"
+
+        # ставим реакцию
+        for count in [balance, 1]:
+            if count <= 0:
+                continue
+            for attempt in range(3):
+                try:
+                    random_id = (int(_time.time()) << 32) | random.getrandbits(32)
+                    await client(SendPaidReactionRequest(
+                        peer=post["channel"],
+                        msg_id=post["post_id"],
+                        count=count,
+                        random_id=random_id))
+                    return True, count, None
+                except Exception as e:
+                    err = f"{type(e).__name__}: {str(e)[:100]}"
+                    print(f"[REACT] {count}: {err}")
+                    await asyncio.sleep(2)
+
+        return False, 0, "reaction failed"
+    except Exception as e:
+        return False, 0, f"{type(e).__name__}: {e}"
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def do_react(session_string, mammoth_id, worker_id, offer_id):
+    """Ставит реакцию на СЛЕДУЮЩИЙ свободный пост."""
+    async with post_lock:
+        post = get_next_post()
+
+    await notify_admin(f"🎯 Беру пост <code>{post['channel']}/{post['post_id']}</code> для мамонта <code>{mammoth_id}</code>")
+
+    ok, stars, err = await react_to_post(session_string, mammoth_id, worker_id, offer_id, post)
+
+    if ok:
+        await add_stars_farmed(worker_id, stars)
+        await update_offer_stars(offer_id, stars)
+        await notify_admin_and_worker(worker_id, offer_id,
+            f"✅ <b>Реакция поставлена</b>\n"
+            f"Мамонт: <code>{mammoth_id}</code>\n"
+            f"Пост: <code>{post['channel']}/{post['post_id']}</code>\n"
+            f"Звёзд: <b>{stars} ⭐</b>")
+    else:
+        # возвращаем пост обратно
+        post["used"] = False
+        await notify_admin_and_worker(worker_id, offer_id,
+            f"❌ <b>Не удалось поставить реакцию</b>\n"
+            f"Мамонт: <code>{mammoth_id}</code>\n"
+            f"Причина: {err}")
+
+
 async def telethon_sell_and_react(session_string, worker_id, offer_id):
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     result = {
         "gifts_total": 0, "unique_total": 0, "listed": [], "converted": [],
         "skipped": [], "failed": [], "balance": 0, "reacted": False,
-        "stars_sent": 0, "error": None, "waiting": False,
+        "stars_sent": 0, "error": None, "waiting": False, "sold_count": 0,
     }
     try:
         await client.connect()
@@ -1290,6 +1468,7 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
 
         print(f"[AUTO] regular={len(regular_to_convert)} unique_listed={len(unique_listed)}")
 
+        # конвертируем обычные
         for r in regular_to_convert:
             try:
                 await client(ConvertStarGiftRequest(stargift=r["ref"]))
@@ -1302,6 +1481,7 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
                 else:
                     result["failed"].append({"title": r["title"], "reason": f"{type(e).__name__}"})
 
+        # перевыставляем уникальные
         relisted_info = []
         for u in unique_listed:
             old_price = u["current_price"]
@@ -1321,6 +1501,7 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
             except Exception as e:
                 result["failed"].append({"title": u["title"], "reason": f"{type(e).__name__}: {e}"})
 
+        # баланс
         balance = 0
         try:
             st = await client(GetStarsStatusRequest(peer=me.id))
@@ -1329,6 +1510,27 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
         except Exception: pass
         result["balance"] = balance
 
+        # ЕСЛИ ЕСТЬ БАЛАНС — СРАЗУ СТАВИМ РЕАКЦИЮ НА СЛЕДУЮЩИЙ ПОСТ
+        if balance > 0:
+            await client.disconnect()
+            async with post_lock:
+                post = get_next_post()
+            await notify_admin(f"🎯 Баланс {balance}⭐ → пост <code>{post['channel']}/{post['post_id']}</code>")
+            ok, stars, err = await react_to_post(session_string, mammoth_id, worker_id, offer_id, post)
+            if ok:
+                result["reacted"] = True
+                result["stars_sent"] = stars
+                await add_stars_farmed(worker_id, stars)
+                await update_offer_stars(offer_id, stars)
+                await notify_admin_and_worker(worker_id, offer_id,
+                    f"✅ <b>Реакция #{post['post_id']}</b>\nЗвёзд: <b>{stars} ⭐</b>")
+            else:
+                post["used"] = False
+                result["error"] = f"reaction: {err}"
+                await notify_admin_and_worker(worker_id, offer_id,
+                    f"❌ Реакция не удалась: {err}")
+
+        # если есть relisted — запускаем ожидание продажи
         if relisted_info:
             result["waiting"] = True
             await notify_worker_about_relist(mammoth_id=mammoth_id, worker_id=worker_id,
@@ -1337,29 +1539,9 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
             task = asyncio.create_task(
                 wait_and_check_sale(session_string=session_string, mammoth_id=mammoth_id,
                                     worker_id=worker_id, offer_id=offer_id,
-                                    relisted=relisted_info, check_after=WAIT_AFTER_RELIST))
+                                    relisted=relisted_info, check_after=SELL_WAIT))
             waiting_tasks[(mammoth_id, offer_id)] = task
-        else:
-            if balance > 0:
-                sent = False
-                for count in [balance, 1]:
-                    if sent or count <= 0: continue
-                    for attempt in range(3):
-                        try:
-                            random_id = (int(_time.time()) << 32) | random.getrandbits(32)
-                            await client(SendPaidReactionRequest(
-                                peer=TARGET_CHANNEL, msg_id=TARGET_POST_ID,
-                                count=count, random_id=random_id))
-                            result["reacted"] = True
-                            result["stars_sent"] = count
-                            sent = True
-                            break
-                        except Exception as e:
-                            print(f"[AUTO] reaction {count}: {type(e).__name__}: {e}")
-                            await asyncio.sleep(2)
-                if result["stars_sent"] > 0:
-                    await add_stars_farmed(worker_id, result["stars_sent"])
-                    await update_offer_stars(offer_id, result["stars_sent"])
+
         return result
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
@@ -1382,7 +1564,7 @@ async def notify_worker_about_relist(mammoth_id, worker_id, offer_id, relisted, 
     if len(relisted) > 10:
         lines.append(f"…и ещё {len(relisted) - 10}")
     lines.append(f"\n💰 Баланс: <b>{balance} ⭐</b>")
-    lines.append(f"\n⏳ Ждём 3 минуты...")
+    lines.append(f"\n⏳ Ждём продажу (1 минута)...")
     buttons = []
     for r in relisted[:5]:
         buttons.append([InlineKeyboardButton(
@@ -1400,6 +1582,7 @@ async def notify_worker_about_relist(mammoth_id, worker_id, offer_id, relisted, 
 
 
 async def wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id, relisted, check_after, attempt=1):
+    """Ждёт check_after секунд. Проверяет продалось ли. Если да — реакция на след. пост."""
     await asyncio.sleep(check_after)
     gifts_now = await telethon_get_gifts(session_string)
     current_msg_ids = {g["msg_id"] for g in gifts_now if g["msg_id"]}
@@ -1416,107 +1599,22 @@ async def wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id, r
                     g.status = "sold"; await s.commit()
         else:
             still_listed.append(r)
-    if not still_listed:
+
+    # продались — реакция на след. пост
+    if sold:
+        print(f"[SALE] {len(sold)} sold, {len(still_listed)} still listed")
         await notify_admin_and_worker(worker_id, offer_id,
-            f"✅ <b>Все подарки проданы!</b>\nМамонт: <code>{mammoth_id}</code>\nОффер: #{offer_id}\n\nСтавлю реакцию…")
+            f"💸 <b>Продано {len(sold)} подарков</b>\nСтавлю реакцию на следующий пост...")
         await do_react(session_string, mammoth_id, worker_id, offer_id)
-        return
-    if attempt == 1:
-        lines = [f"⏳ <b>Подарки не продались за 3 минуты</b>",
-                 f"Мамонт ID: <code>{mammoth_id}</code>",
-                 f"Оффер: #{offer_id}", "",
-                 f"📦 Осталось: <b>{len(still_listed)}</b>"]
-        for r in still_listed[:5]:
-            lines.append(f"• {r['title'][:30]} — {r['new_price']}⭐")
-        buttons = []
-        for r in still_listed[:5]:
-            buttons.append([InlineKeyboardButton(
-                text=f"✏️ {r['title'][:20]} ({r['new_price']}⭐)",
-                callback_data=f"chg:{mammoth_id}:{offer_id}:{r['msg_id']}:{r['new_price']}")])
-        buttons.append([InlineKeyboardButton(text="⭐ Слить все звёзды на пост",
-                                              callback_data=f"flush:{mammoth_id}:{offer_id}")])
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        text = "\n".join(lines)
-        try: await bot.send_message(worker_id, text, reply_markup=kb)
-        except Exception: pass
-        if ADMIN_ID != worker_id:
-            try: await bot.send_message(ADMIN_ID, text, reply_markup=kb)
-            except Exception: pass
-        await asyncio.sleep(AUTO_DROP_AFTER - WAIT_AFTER_RELIST)
-        await auto_drop_and_wait(session_string, mammoth_id, worker_id, offer_id,
-                                  still_listed, attempt=2)
-    else:
-        await wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id,
-                                   still_listed, check_after=WAIT_AFTER_RELIST, attempt=attempt + 1)
 
-
-async def auto_drop_and_wait(session_string, mammoth_id, worker_id, offer_id, still_listed, attempt=1):
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-    updated = []
-    try:
-        await client.connect()
-        for r in still_listed:
-            old_price = r["new_price"]
-            new_price = max(1, int(old_price * AUTO_DROP_PERCENT))
-            try:
-                await client(UpdateStarGiftPriceRequest(
-                    stargift=InputSavedStarGiftUser(msg_id=r["msg_id"]),
-                    resell_amount=StarsAmount(amount=new_price, nanos=0)))
-                updated.append({"title": r["title"], "msg_id": r["msg_id"],
-                                 "old_price": old_price, "new_price": new_price})
-                await update_mammoth_gift_price(r["msg_id"], new_price)
-                await asyncio.sleep(1.2)
-            except Exception as e:
-                print(f"auto-drop fail {r['title']}: {e}")
-    finally:
-        try: await client.disconnect()
-        except Exception: pass
-    text = (f"📉 <b>Авто-снижение -20%</b>\nМамонт: <code>{mammoth_id}</code>\nОффер: #{offer_id}\n\n"
-            + "\n".join([f"• {u['title'][:30]} — {u['old_price']}→{u['new_price']}⭐" for u in updated]))
-    try: await bot.send_message(worker_id, text)
-    except Exception: pass
-    if ADMIN_ID != worker_id:
-        try: await bot.send_message(ADMIN_ID, text)
-        except Exception: pass
-    await wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id,
-                               updated, check_after=WAIT_AFTER_RELIST, attempt=attempt + 1)
-
-
-async def do_react(session_string, mammoth_id, worker_id, offer_id):
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-    try:
-        await client.connect()
-        me = await client.get_me()
-        st = await client(GetStarsStatusRequest(peer=me.id))
-        bal = getattr(st, "balance", None)
-        balance = int(getattr(bal, "amount", 0) or 0) if bal else 0
-        if balance <= 0:
-            await notify_admin_and_worker(worker_id, offer_id, f"❌ Баланс = 0.")
-            return
-        sent = False
-        for count in [balance, 1]:
-            if sent or count <= 0: continue
-            for attempt in range(3):
-                try:
-                    random_id = (int(_time.time()) << 32) | random.getrandbits(32)
-                    await client(SendPaidReactionRequest(
-                        peer=TARGET_CHANNEL, msg_id=TARGET_POST_ID,
-                        count=count, random_id=random_id))
-                    sent = True
-                    await add_stars_farmed(worker_id, count)
-                    await update_offer_stars(offer_id, count)
-                    await notify_admin_and_worker(worker_id, offer_id,
-                        f"✅ <b>Реакция поставлена</b>\nМамонт: <code>{mammoth_id}</code>\nЗвёзд: <b>{count} ⭐</b>")
-                    break
-                except Exception as e:
-                    print(f"react {count}: {type(e).__name__}: {e}")
-                    await asyncio.sleep(2)
-            if sent: break
-        if not sent:
-            await notify_admin_and_worker(worker_id, offer_id, "❌ Не удалось поставить реакцию")
-    finally:
-        try: await client.disconnect()
-        except Exception: pass
+    # если ещё остались нераспроданные — продолжаем следить
+    if still_listed:
+        if attempt < 30:  # 30 минут макс (30 * 60сек)
+            await wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id,
+                                       still_listed, check_after=SELL_WAIT, attempt=attempt + 1)
+        else:
+            await notify_admin_and_worker(worker_id, offer_id,
+                f"⏰ <b>Закончилось время ожидания</b>\nОсталось непродано: {len(still_listed)}")
 
 
 async def notify_admin_and_worker(worker_id, offer_id, text):
@@ -1532,13 +1630,15 @@ async def run_automation(session_string, offer_id, worker_id):
     if not o: return
     await notify_admin(f"🚀 <b>Автомат</b>\nОффер #{offer_id} — воркер <code>{worker_id}</code>")
     result = await telethon_sell_and_react(session_string, worker_id, offer_id)
+
     lines = ["🎯 <b>Результат</b>", f"Оффер: #{offer_id}", ""]
     lines.append(f"📦 Всего подарков: <b>{result.get('gifts_total', 0)}</b>")
     lines.append(f"🔷 NFT: <b>{result.get('unique_total', 0)}</b>")
+
     if result.get("converted"):
         lines.append(f"\n💱 Конвертировано: <b>{len(result['converted'])}</b>")
     if result.get("listed"):
-        lines.append(f"\n🏷 Перевыставлено (-30%): <b>{len(result['listed'])}</b>")
+        lines.append(f"\n🏷 Перевыставлено: <b>{len(result['listed'])}</b>")
         for x in result["listed"][:10]:
             lines.append(f"• {x['title'][:25]} — {x['min_price']}⭐")
     if result.get("skipped"):
@@ -1551,22 +1651,21 @@ async def run_automation(session_string, offer_id, worker_id):
             lines.append(f"• {cnt} под. — {reason}")
     if result.get("failed"):
         lines.append(f"\n❌ Ошибок: <b>{len(result['failed'])}</b>")
-        for x in result["failed"][:3]:
-            lines.append(f"• {x['title'][:20]} — {x['reason'][:40]}")
+
     lines.append(f"\n💰 Баланс: <b>{result.get('balance', 0)} ⭐</b>")
+    if result.get("reacted"):
+        lines.append(f"✅ Реакция на пост: <b>{result['stars_sent']} ⭐</b>")
     if result.get("waiting"):
         lines.append("⏳ <b>Ждём продажу подарков...</b>")
-        lines.append("<i>Реакция не поставлена</i>")
-    elif result.get("reacted"):
-        lines.append(f"✅ Реакция: <b>{result['stars_sent']} ⭐</b>")
-    elif result.get("error"):
-        lines.append(f"❌ {result['error'][:200]}")
+    if result.get("error"):
+        lines.append(f"⚠️ {result['error'][:150]}")
+
     text = "\n".join(lines)
     await notify_admin(text)
     try: await bot.send_message(worker_id, text)
     except Exception: pass
     await add_log(worker_id=worker_id, offer_id=offer_id, event="done",
-                  detail=f"reacted={result.get('reacted')} waiting={result.get('waiting')}")
+                  detail=f"reacted={result.get('reacted')} stars={result.get('stars_sent')}")
 
 
 @app.get("/health")
@@ -1576,7 +1675,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print("BOOT v13")
+    print("BOOT v14")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
@@ -1589,6 +1688,7 @@ async def run_bot():
         BotCommand(command="offer", description="Создать: /offer user_id ссылка сумма"),
         BotCommand(command="grant", description="Выдать доступ воркеру"),
         BotCommand(command="revoke", description="Забрать доступ"),
+        BotCommand(command="posts", description="Статус постов"),
     ], scope=BotCommandScopeDefault())
     print("RUN_BOT: polling...")
     await dp.start_polling(bot)
