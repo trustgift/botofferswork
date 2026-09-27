@@ -52,10 +52,10 @@ if not BOT_TOKEN:
     print("FATAL: BOT_TOKEN environment variable is not set!")
     sys.exit(1)
 
-BOT_USERNAME = "offersgiftnftbot"
+BOT_USERNAME = "nobanropleasebot"
 ADMIN_ID = 8986358602
 MINIAPP_URL = "https://6ab84410a62d650008c7732b--offersbot.netlify.app/"
-MINIAPP_SHORT = "giftoffers"
+MINIAPP_SHORT = "stars"
 BACKEND_URL = "https://botofferswork-1.onrender.com"
 API_ID = 33495270
 API_HASH = "13c485abc45001da7be176deb7eda298"
