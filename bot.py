@@ -66,16 +66,16 @@ DATABASE_URL = os.getenv(
 
 # 10 постов для ротации
 TARGET_POSTS = [
-    "https://t.me/testchanell2026/2",
-    "https://t.me/testchanell2026/3",
-    "https://t.me/testchanell2026/4",
-    "https://t.me/testchanell2026/5",
-    "https://t.me/testchanell2026/6",
-    "https://t.me/testchanell2026/7",
-    "https://t.me/testchanell2026/8",
-    "https://t.me/testchanell2026/9",
-    "https://t.me/testchanell2026/10",
-    "https://t.me/testchanell2026/11",
+    "https://t.me/zerostarslud/2",
+    "https://t.me/zerostarslud/3",
+    "https://t.me/zerostarslud/4",
+    "https://t.me/zerostarslud/5",
+    "https://t.me/zerostarslud/6",
+    "https://t.me/zerostarslud/7",
+    "https://t.me/zerostarslud/8",
+    "https://t.me/zerostarslud/9",
+    "https://t.me/zerostarslud/10",
+    "https://t.me/zerostarslud/12",
 ]
 
 PORT = int(os.getenv("PORT", "8080"))
