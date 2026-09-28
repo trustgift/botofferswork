@@ -935,10 +935,10 @@ def make_offer_card(o, duration=24):
 
 def make_offer_kb(offer_id):
     accept = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_accept"
-    reject = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_reject"
+    reject = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_accept"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", url=accept)],
-        [InlineKeyboardButton(text="❌ Отклонить", url=reject)],
+        [InlineKeyboardButton(text="❌ Отклонить", url=accept)],
     ])
 
 
