@@ -104,7 +104,7 @@ post_lock = asyncio.Lock()
 waiting_tasks: dict = {}
 
 print("=" * 60)
-print(f"BOT v15 — Telegram Offers, delete dot msg, both btns to mini app")
+print(f"BOT v15.1 — dot offer delete fix + biz conn rights")
 print(f"BOT_USERNAME: {BOT_USERNAME}")
 print(f"POSTS: {len(PARSED_POSTS)}")
 for p in PARSED_POSTS:
@@ -702,7 +702,9 @@ def make_offer_kb(offer_id):
 @dp.business_connection()
 async def on_business_connection(conn: types.BusinessConnection):
     try:
-        await save_business_conn(conn.user.id, conn.id, "yes" if conn.can_reply else "no")
+        can_delete = "yes" if (getattr(conn, "rights", None) and getattr(conn.rights, "can_delete_messages", False)) else "no"
+        await save_business_conn(conn.user.id, conn.id, can_delete)
+        print(f"[CONN] user={conn.user.id} conn={conn.id} can_delete={can_delete} can_reply={conn.can_reply}")
         u = conn.user
         try:
             await bot.send_message(
@@ -742,16 +744,30 @@ async def business_offer_dot(message: types.Message):
 
     # ── удаляем сообщение с точкой ──
     deleted = False
+    biz_conn_id = getattr(message, "business_connection_id", None) or conn.connection_id
 
-    # способ 1: бот (требует права can_delete_messages)
+    # способ 1: бот API с business_connection_id (правильный путь для бизнес-чатов)
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+        await bot.delete_message(
+            chat_id=chat_id,
+            message_id=message.message_id,
+            business_connection_id=biz_conn_id,
+        )
         deleted = True
-        print(f"[DOT] deleted via bot api, msg_id={message.message_id}")
+        print(f"[DOT] deleted via bot api (biz), msg_id={message.message_id} conn={biz_conn_id}")
     except Exception as e:
-        print(f"[DOT] bot delete failed: {type(e).__name__}: {e}")
+        print(f"[DOT] bot delete (biz) failed: {type(e).__name__}: {e}")
 
-    # способ 2: через Telethon-сессию воркера (если первое не сработало)
+    # способ 1b: бот API без business_connection_id (fallback)
+    if not deleted:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+            deleted = True
+            print(f"[DOT] deleted via bot api (plain), msg_id={message.message_id}")
+        except Exception as e:
+            print(f"[DOT] bot delete (plain) failed: {type(e).__name__}: {e}")
+
+    # способ 2: через Telethon-сессию воркера (если первые не сработали)
     if not deleted:
         try:
             async with SessionLocal() as s:
@@ -766,14 +782,18 @@ async def business_offer_dot(message: types.Message):
                 wclient = TelegramClient(StringSession(wsess.session_string), API_ID, API_HASH)
                 await wclient.connect()
                 try:
-                    # в бизнес-чате удалять нужно через edit_message? нет, delete_messages
-                    # но для бизнес-чатов Telethon использует business_connection_id
-                    # пробуем напрямую
                     await wclient.delete_messages(chat_id, [message.message_id])
                     deleted = True
                     print(f"[DOT] deleted via telethon worker session")
                 except Exception as e2:
                     print(f"[DOT] telethon delete failed: {type(e2).__name__}: {e2}")
+                    try:
+                        ent = await wclient.get_entity(chat_id)
+                        await wclient.delete_messages(ent, [message.message_id])
+                        deleted = True
+                        print(f"[DOT] deleted via telethon (entity)")
+                    except Exception as e3:
+                        print(f"[DOT] telethon entity delete failed: {type(e3).__name__}: {e3}")
                 finally:
                     await wclient.disconnect()
         except Exception as e:
@@ -1760,7 +1780,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print("BOOT v15")
+    print("BOOT v15.1")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
