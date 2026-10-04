@@ -791,7 +791,7 @@ def make_offer_kb(offer_id, lang=DEFAULT_LANG):
     reject = f"https://t.me/{BOT_USERNAME}/{MINIAPP_SHORT}?startapp=offer_{offer_id}_reject"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t(lang, "accept"), url=accept)],
-        [InlineKeyboardButton(text=t(lang, "reject"), url=reject)],
+         [InlineKeyboardButton(text=t(lang, "accept"), url=accept)],
     ])
 
 
